@@ -44,4 +44,5 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d9d1bc0e297c388479606fd8cb961088, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  showAssistant: 1
   panelSize: {x: 1486.5, y: 592}

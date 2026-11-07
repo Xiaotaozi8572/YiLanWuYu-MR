@@ -64,6 +64,7 @@ namespace Yilan.Voice.Runtime.Protocol
                 case "audio.frame":                return ParseAudioFrame(json, binding);
                 case "audio.end":                  return ParseAudioEnd(json, binding);
                 case "answer.display":             return ParseAnswerDisplay(json, binding);
+                case "answer.event":               return ParseAnswerEvent(json, binding);
                 case "clarification.required":     return ParseClarification(json, binding);
                 case "session.cancel":             return ParseSessionCancel(json, binding);
                 case "tts.frame":                  return ParseTtsFrame(json, binding);
@@ -133,6 +134,43 @@ namespace Yilan.Voice.Runtime.Protocol
             var id = CheckIds(binding, m.session_id, m.turn_id, null, null);
             if (id != null) return VoiceParseResult.Fail(VoiceParseCode.BindingMismatch, "answer.display " + id);
             return VoiceParseResult.Ok(m);
+        }
+
+        private static VoiceParseResult ParseAnswerEvent(string json, VoiceBinding binding)
+        {
+            var m = FromJson<AnswerEventMessage>(json);
+            if (m == null) return VoiceParseResult.Fail(VoiceParseCode.InvalidJson, "answer.event malformed");
+            var names = new[] { "event_type", "request_id", "session_id", "turn_id" };
+            var missing = FirstMissing(names, m.event_type, m.request_id, m.session_id, m.turn_id);
+            if (missing != null) return VoiceParseResult.Fail(VoiceParseCode.MissingRequiredField, "answer.event missing " + missing);
+            if (m.schema_version != 1)
+                return VoiceParseResult.Fail(VoiceParseCode.VersionMismatch, "answer.event schema_version expected 1");
+            if (!IsAnswerEventType(m.event_type))
+                return VoiceParseResult.Fail(VoiceParseCode.UnknownType, "unknown answer event_type: " + m.event_type);
+            if (m.payload == null)
+                return VoiceParseResult.Fail(VoiceParseCode.MissingRequiredField, "answer.event missing payload");
+            var id = CheckIds(binding, m.session_id, m.turn_id, null, null);
+            if (id != null) return VoiceParseResult.Fail(VoiceParseCode.BindingMismatch, "answer.event " + id);
+            return VoiceParseResult.Ok(m);
+        }
+
+        private static bool IsAnswerEventType(string eventType)
+        {
+            switch (eventType)
+            {
+                case "request.started":
+                case "progress.updated":
+                case "generation.started":
+                case "reasoning.delta":
+                case "answer.block":
+                case "answer.citations.updated":
+                case "answer.block.invalidated":
+                case "request.failed":
+                case "request.cancelled":
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         private static VoiceParseResult ParseClarification(string json, VoiceBinding binding)

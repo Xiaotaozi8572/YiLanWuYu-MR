@@ -10,6 +10,7 @@ namespace Yilan.Voice.Runtime.Protocol
         public string turn_id;
         public string audio_stream_id;
         public string user_id; // optional
+        public string[] capabilities; // optional feature negotiation, e.g. answer-stream-v1
     }
 
     /// <summary>voice.state — server -> client. protocol_version present ONLY for status == session.started.</summary>
@@ -21,6 +22,7 @@ namespace Yilan.Voice.Runtime.Protocol
         public string state;
         public string status;
         public string protocol_version;
+        public string[] accepted_capabilities;
     }
 
     /// <summary>audio.frame — client -> server, TEXT header immediately followed by a PCM16 binary body.</summary>
@@ -51,7 +53,59 @@ namespace Yilan.Voice.Runtime.Protocol
     public class PublicAnswer
     {
         public string content;
+        public string short_answer;
+        public string main_answer;
         public string source;
+    }
+
+    [Serializable]
+    public class AnswerStreamCitation
+    {
+        public string token;
+        public string state;
+        public string title;
+        public string url;
+        public string provenance;
+    }
+
+    [Serializable]
+    public class AnswerStreamPayload
+    {
+        public int attempt;
+        public string origin;
+        public string reason;
+        public string stage;
+        public string status;
+        public int block_id;
+        public string text;
+        public string code;
+        public string[] evidence_ids;
+        public AnswerStreamCitation[] citations;
+    }
+
+    /// <summary>answer.event — negotiated answer-stream-v1 candidate/progress event.</summary>
+    [Serializable]
+    public class AnswerEventMessage : VoiceEnvelope
+    {
+        public int schema_version;
+        public string event_type;
+        public string request_id;
+        public string session_id;
+        public string turn_id;
+        public int sequence;
+        public AnswerStreamPayload payload;
+    }
+
+    [Serializable]
+    public class AnswerStreamSummary
+    {
+        public int schema_version;
+        public string request_id;
+        public int sequence;
+        public int attempt;
+        public string origin;
+        public bool reasoning_available;
+        public AnswerStreamCitation[] citations;
     }
 
     /// <summary>answer.display — server -> client, final answer for status == answered.</summary>
@@ -63,6 +117,7 @@ namespace Yilan.Voice.Runtime.Protocol
         public string answer_id;
         public string evidence_package_id;
         public PublicAnswer answer;
+        public AnswerStreamSummary stream;
     }
 
     /// <summary>clarification.required — server -> client, asks for clarification or reports too-long input.</summary>

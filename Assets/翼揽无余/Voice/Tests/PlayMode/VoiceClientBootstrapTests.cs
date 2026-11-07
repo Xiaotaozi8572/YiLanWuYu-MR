@@ -1,10 +1,12 @@
 using System.Collections;
 using System.Reflection;
+using System.Threading.Tasks;
 using NUnit.Framework;
 using UnityEngine;
 using UnityEngine.TestTools;
 using UnityEngine.UI;
 using Yilan.Voice.Runtime.Bootstrap;
+using Yilan.Voice.Runtime.Transport;
 using Yilan.Voice.Runtime.UI;
 
 namespace Yilan.Voice.Remediation
@@ -68,6 +70,60 @@ namespace Yilan.Voice.Remediation
 
             Object.Destroy(go);
             yield return null;
+        }
+
+        [UnityTest]
+        public IEnumerator Bootstrap_DestroyedDuringSuccessfulHealthProbe_StopsStartup()
+        {
+            return DestroyDuringHealthProbe(VoiceHealthStatus.Ok);
+        }
+
+        [UnityTest]
+        public IEnumerator Bootstrap_DestroyedDuringFailedHealthProbe_StopsStartup()
+        {
+            return DestroyDuringHealthProbe(VoiceHealthStatus.Unreachable);
+        }
+
+        private static IEnumerator DestroyDuringHealthProbe(VoiceHealthStatus status)
+        {
+            var originalTransport = VoiceHealthClient.Transport;
+            var probe = new TaskCompletionSource<VoiceHealthResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            GameObject root = null;
+            try
+            {
+                VoiceHealthClient.Transport = (_, __, ___) => probe.Task;
+                root = BuildValidBootstrapRoot();
+                var bootstrap = root.GetComponent<VoiceClientBootstrap>();
+                // Wiring is supplied after AddComponent's Awake in this harness.
+                // Disable automatic Start so the test can observe the startup Task directly.
+                bootstrap.enabled = false;
+                typeof(VoiceClientBootstrap).GetMethod("Awake", BindingFlags.Instance | BindingFlags.NonPublic)
+                    .Invoke(bootstrap, null);
+                var runtime = bootstrap.Runtime;
+                Assert.IsNotNull(runtime);
+                var startup = (Task)typeof(VoiceClientBootstrap)
+                    .GetMethod("StartRuntimeAsync", BindingFlags.Instance | BindingFlags.NonPublic)
+                    .Invoke(bootstrap, null);
+                Assert.IsFalse(startup.IsCompleted);
+
+                Object.Destroy(root);
+                yield return null;
+                Assert.IsTrue(bootstrap == null, "destroy the owner before completing the probe");
+                probe.SetResult(new VoiceHealthResult(status, status == VoiceHealthStatus.Ok ? (int?)200 : null, "test"));
+
+                float deadline = Time.realtimeSinceStartup + 5f;
+                while (!startup.IsCompleted && Time.realtimeSinceStartup < deadline) yield return null;
+                Assert.IsTrue(startup.IsCompleted, "startup did not settle after the probe completed");
+                startup.GetAwaiter().GetResult(); // propagates the original NullReferenceException on regression
+                Assert.IsNull(runtime.Controller);
+                Assert.IsNull(runtime.ViewModel);
+            }
+            finally
+            {
+                VoiceHealthClient.Transport = originalTransport;
+                probe.TrySetResult(new VoiceHealthResult(VoiceHealthStatus.Unreachable, null, "cleanup"));
+                if (root != null) Object.DestroyImmediate(root);
+            }
         }
 
         private static GameObject BuildValidBootstrapRoot()

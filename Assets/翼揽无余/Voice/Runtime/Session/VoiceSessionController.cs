@@ -65,6 +65,10 @@ namespace Yilan.Voice.Runtime.Session
         private bool _turnActive;
         private bool _answered;
         private bool _playbackCompleted;
+        private bool _answerStreamAccepted;
+        private string _answerStreamRequestId;
+        private int _answerStreamSequence = -1;
+        private int _answerStreamAttempt;
         private bool _disposed;
 
         /// <summary>Injectable health preflight; null skips the probe. Production wires
@@ -75,6 +79,8 @@ namespace Yilan.Voice.Runtime.Session
         public event Action<VoiceClientState> StateChanged;
         /// <summary>Fired when an answer.display (final text) is applied.</summary>
         public event Action<string> AnswerReceived;
+        /// <summary>Fired for accepted answer-stream-v1 progress/candidate events.</summary>
+        public event Action<AnswerEventMessage> AnswerStreamReceived;
         /// <summary>Fired when a tts.frame is accepted (body pairing is a transport concern).</summary>
         public event Action<TtsFrameMessage> TtsFrameAccepted;
         /// <summary>Fired when an asr.partial / asr.final transcript for the bound turn is
@@ -103,6 +109,7 @@ namespace Yilan.Voice.Runtime.Session
         public string TurnId => _turnId;
         public string AudioStreamId => _audioStreamId;
         public string PlaybackId => _playbackId;
+        public bool AnswerStreamAccepted => _answerStreamAccepted;
         /// <summary>Last rejection classification (for diagnostics/tests).</summary>
         public VoiceCommandResult LastRejection { get; private set; } = VoiceCommandResult.Ok;
 
@@ -213,6 +220,7 @@ namespace Yilan.Voice.Runtime.Session
 
             if (!_turnActive || !_sessionStartSent)
             {
+                ResetAnswerStreamTurnState();
                 _turnCounter++;
                 _turnId = "turn-" + _turnCounter.ToString("D4");
                 _audioStreamId = "stream-audio-" + _turnCounter;
@@ -621,6 +629,7 @@ namespace Yilan.Voice.Runtime.Session
             // While connecting (initial or after reconnect), establish the session binding.
             if ((_state == VoiceClientState.Connecting || _state == VoiceClientState.Reconnecting) && !_sessionStartSent)
             {
+                ResetAnswerStreamState();
                 _turnCounter++;
                 _turnId = "turn-" + _turnCounter.ToString("D4");
                 _audioStreamId = "stream-audio-" + _turnCounter;
@@ -792,6 +801,7 @@ namespace Yilan.Voice.Runtime.Session
             {
                 case "voice.state": HandleVoiceState((VoiceStateMessage)msg); break;
                 case "answer.display": HandleAnswer((AnswerDisplayMessage)msg); break;
+                case "answer.event": HandleAnswerEvent((AnswerEventMessage)msg); break;
                 case "tts.frame": HandleTts((TtsFrameMessage)msg); break;
                 case "clarification.required": HandleClarification((ClarificationRequiredMessage)msg); break;
                 case "asr.partial":
@@ -849,7 +859,44 @@ namespace Yilan.Voice.Runtime.Session
             };
             _turnActive = true;
             _expectedAudioSeq = 0;
+            _answerStreamAccepted = ContainsCapability(m.accepted_capabilities, "answer-stream-v1");
             Transition(VoiceClientState.Ready);
+        }
+
+        private void HandleAnswerEvent(AnswerEventMessage m)
+        {
+            if (!_answerStreamAccepted || !_turnActive)
+            {
+                Reject(VoiceCommandResult.StaleTurn);
+                return;
+            }
+
+            if (_answerStreamRequestId == null)
+                _answerStreamRequestId = m.request_id;
+            else if (_answerStreamRequestId != m.request_id)
+            {
+                Reject(VoiceCommandResult.StaleTurn);
+                return;
+            }
+
+            // Sequence gaps are legal; duplicates and backwards events are not.
+            if (m.sequence <= _answerStreamSequence)
+            {
+                Reject(VoiceCommandResult.SequenceMismatch);
+                return;
+            }
+
+            int attempt = m.payload != null ? m.payload.attempt : 0;
+            if (attempt > 0 && attempt < _answerStreamAttempt)
+            {
+                Reject(VoiceCommandResult.StaleTurn);
+                return;
+            }
+            if (attempt > _answerStreamAttempt)
+                _answerStreamAttempt = attempt;
+
+            _answerStreamSequence = m.sequence;
+            AnswerStreamReceived?.Invoke(m);
         }
 
         private void HandleAnswer(AnswerDisplayMessage m)
@@ -884,7 +931,7 @@ namespace Yilan.Voice.Runtime.Session
                 PlaybackId = null
             };
             Transition(VoiceClientState.Playing);
-            AnswerReceived?.Invoke(m.answer?.content ?? string.Empty);
+            AnswerReceived?.Invoke(GetAnswerText(m.answer));
         }
 
         private void HandleTts(TtsFrameMessage m)
@@ -993,11 +1040,41 @@ namespace Yilan.Voice.Runtime.Session
                 type = "session.start",
                 session_id = _sessionId,
                 turn_id = _turnId,
-                audio_stream_id = _audioStreamId
+                audio_stream_id = _audioStreamId,
+                capabilities = new[] { "answer-stream-v1" }
             };
             _sessionStartSent = true;
             _expectedAudioSeq = 0;
             TrySendText(JsonUtility.ToJson(start));
+        }
+
+        private void ResetAnswerStreamState()
+        {
+            _answerStreamAccepted = false;
+            ResetAnswerStreamTurnState();
+        }
+
+        private void ResetAnswerStreamTurnState()
+        {
+            _answerStreamRequestId = null;
+            _answerStreamSequence = -1;
+            _answerStreamAttempt = 0;
+        }
+
+        private static bool ContainsCapability(string[] capabilities, string expected)
+        {
+            if (capabilities == null) return false;
+            for (int i = 0; i < capabilities.Length; i++)
+                if (capabilities[i] == expected) return true;
+            return false;
+        }
+
+        private static string GetAnswerText(PublicAnswer answer)
+        {
+            if (answer == null) return string.Empty;
+            if (!string.IsNullOrEmpty(answer.content)) return answer.content;
+            if (!string.IsNullOrEmpty(answer.main_answer)) return answer.main_answer;
+            return answer.short_answer ?? string.Empty;
         }
 
         /// <summary>Random, wire-legal session id (server _ID_PATTERN: alnum first char,

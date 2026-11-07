@@ -3149,6 +3149,7 @@ GameObject:
   - component: {fileID: 290521695}
   - component: {fileID: 290521694}
   - component: {fileID: 290521693}
+  - component: {fileID: 910000000000000000}
   m_Layer: 5
   m_Name: "\u70B9\u51FB\u62C6\u5206"
   m_TagString: Untagged
@@ -3219,6 +3220,18 @@ MonoBehaviour:
   m_OnClick:
     m_PersistentCalls:
       m_Calls:
+      - m_Target: {fileID: 910000000000000000}
+        m_TargetAssemblyTypeName: ButtonClickAudio, Assembly-CSharp
+        m_MethodName: PlayClickSound
+        m_Mode: 1
+        m_Arguments:
+          m_ObjectArgument: {fileID: 0}
+          m_ObjectArgumentAssemblyTypeName: UnityEngine.Object, UnityEngine
+          m_IntArgument: 0
+          m_FloatArgument: 0
+          m_StringArgument: 
+          m_BoolArgument: 0
+        m_CallState: 2
       - m_Target: {fileID: 1210873458}
         m_TargetAssemblyTypeName: AircraftDisassemblyController, Assembly-CSharp
         m_MethodName: TriggerDisassembly
@@ -9340,6 +9353,7 @@ GameObject:
   - component: {fileID: 775187103}
   - component: {fileID: 775187102}
   - component: {fileID: 775187101}
+  - component: {fileID: 910000000000000001}
   m_Layer: 5
   m_Name: "\u8FD4\u56DE"
   m_TagString: Untagged
@@ -9363,7 +9377,7 @@ RectTransform:
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
   m_AnchorMin: {x: 0.5, y: 0.5}
   m_AnchorMax: {x: 0.5, y: 0.5}
-  m_AnchoredPosition: {x: -349.75, y: 197.10591}
+  m_AnchoredPosition: {x: -368, y: 486}
   m_SizeDelta: {x: 70, y: 70}
   m_Pivot: {x: 0.5, y: 0.5}
 --- !u!114 &775187101
@@ -9410,6 +9424,18 @@ MonoBehaviour:
   m_OnClick:
     m_PersistentCalls:
       m_Calls:
+      - m_Target: {fileID: 910000000000000001}
+        m_TargetAssemblyTypeName: ButtonClickAudio, Assembly-CSharp
+        m_MethodName: PlayClickSound
+        m_Mode: 1
+        m_Arguments:
+          m_ObjectArgument: {fileID: 0}
+          m_ObjectArgumentAssemblyTypeName: UnityEngine.Object, UnityEngine
+          m_IntArgument: 0
+          m_FloatArgument: 0
+          m_StringArgument: 
+          m_BoolArgument: 0
+        m_CallState: 2
       - m_Target: {fileID: 949104904}
         m_TargetAssemblyTypeName: SceneLoader, Assembly-CSharp
         m_MethodName: LoadScene
@@ -9437,7 +9463,7 @@ MonoBehaviour:
   m_Material: {fileID: 0}
   m_Color: {r: 1, g: 1, b: 1, a: 1}
   m_RaycastTarget: 1
-  m_RaycastPadding: {x: 0, y: 0, z: 0, w: 0}
+  m_RaycastPadding: {x: -100, y: -100, z: -100, w: -100}
   m_Maskable: 1
   m_OnCullStateChanged:
     m_PersistentCalls:
@@ -20288,7 +20314,7 @@ Transform:
   m_GameObject: {fileID: 1210873455}
   serializedVersion: 2
   m_LocalRotation: {x: -0.05363521, y: 0.43526718, z: 0.092457265, w: 0.8939337}
-  m_LocalPosition: {x: -0.051, y: 1.163, z: 1.714}
+  m_LocalPosition: {x: -0.141, y: 0.987, z: 1.407}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children:
@@ -29039,7 +29065,7 @@ RectTransform:
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
   m_AnchorMin: {x: 0.5, y: 0.5}
   m_AnchorMax: {x: 0.5, y: 0.5}
-  m_AnchoredPosition: {x: 3.75, y: 202.894}
+  m_AnchoredPosition: {x: -87, y: -97}
   m_SizeDelta: {x: 769.5, y: 464.212}
   m_Pivot: {x: 0.5, y: 0.5}
 --- !u!1 &1652852814 stripped
@@ -32248,7 +32274,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 2857007080405032319, guid: 0a2cc7da0528485459f1a5403f6bfbf4, type: 3}
       propertyPath: m_LocalPosition.y
-      value: 0
+      value: -0.178
       objectReference: {fileID: 0}
     - target: {fileID: 2857007080405032319, guid: 0a2cc7da0528485459f1a5403f6bfbf4, type: 3}
       propertyPath: m_LocalPosition.z
@@ -35888,6 +35914,7 @@ GameObject:
   - component: {fileID: 2098962417}
   - component: {fileID: 2098962416}
   - component: {fileID: 2098962415}
+  - component: {fileID: 910000000000000002}
   m_Layer: 5
   m_Name: "\u70B9\u51FB\u5408\u5E76"
   m_TagString: Untagged
@@ -35958,6 +35985,18 @@ MonoBehaviour:
   m_OnClick:
     m_PersistentCalls:
       m_Calls:
+      - m_Target: {fileID: 910000000000000002}
+        m_TargetAssemblyTypeName: ButtonClickAudio, Assembly-CSharp
+        m_MethodName: PlayClickSound
+        m_Mode: 1
+        m_Arguments:
+          m_ObjectArgument: {fileID: 0}
+          m_ObjectArgumentAssemblyTypeName: UnityEngine.Object, UnityEngine
+          m_IntArgument: 0
+          m_FloatArgument: 0
+          m_StringArgument: 
+          m_BoolArgument: 0
+        m_CallState: 2
       - m_Target: {fileID: 1210873458}
         m_TargetAssemblyTypeName: AircraftDisassemblyController, Assembly-CSharp
         m_MethodName: ResetToComplete
@@ -37376,6 +37415,48 @@ BoxCollider:
   serializedVersion: 3
   m_Size: {x: 0.015, y: 0.029400654, z: 0.029400706}
   m_Center: {x: -0.1844343, y: 0.09312837, z: 0.3480697}
+--- !u!114 &910000000000000000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 290521691}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e16920e4d86f420ab78939c443afcc35, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  clickSound: {fileID: 8300000, guid: 547486769ace46399a443db218b8fc0a, type: 3}
+  volume: 0.65
+--- !u!114 &910000000000000001
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 775187099}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e16920e4d86f420ab78939c443afcc35, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  clickSound: {fileID: 8300000, guid: 547486769ace46399a443db218b8fc0a, type: 3}
+  volume: 0.65
+--- !u!114 &910000000000000002
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2098962413}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e16920e4d86f420ab78939c443afcc35, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  clickSound: {fileID: 8300000, guid: 547486769ace46399a443db218b8fc0a, type: 3}
+  volume: 0.65
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

@@ -25,6 +25,7 @@ namespace Yilan.Voice.Runtime.Bootstrap
         private readonly UnityMicrophoneSource _microphone;
         private readonly ITtsPlayback _playback;
         private readonly VoiceMetricsRecorder _metrics;
+        private readonly object _lifecycleGate = new object();
 
         private VoiceSessionController _controller;
         private VoiceViewModel _viewModel;
@@ -57,11 +58,16 @@ namespace Yilan.Voice.Runtime.Bootstrap
 
         public async Task<VoiceCommandResult> StartAsync()
         {
-            ThrowIfDisposed();
-
-            if (_controller != null)
+            Task<VoiceCommandResult> connectTask;
+            lock (_lifecycleGate)
             {
-                return await _controller.ConnectAsync().ConfigureAwait(false);
+                ThrowIfDisposed();
+                connectTask = _controller?.ConnectAsync();
+            }
+
+            if (connectTask != null)
+            {
+                return await connectTask.ConfigureAwait(false);
             }
 
             bool healthy;
@@ -74,17 +80,24 @@ namespace Yilan.Voice.Runtime.Bootstrap
                 healthy = false;
             }
 
-            if (!healthy)
+            // The probe resumes on a worker thread. Serialize resource creation with
+            // Dispose so a late response cannot resurrect a destroyed client's session.
+            lock (_lifecycleGate)
             {
-                return VoiceCommandResult.TransportFailed;
-            }
+                if (_disposed) return VoiceCommandResult.InvalidState;
+                if (!healthy) return VoiceCommandResult.TransportFailed;
 
-            _controller = new VoiceSessionController(_config, _socket, _playback)
-            {
-                HealthProbe = _ => Task.FromResult(true)
-            };
-            _viewModel = new VoiceViewModel(_controller);
-            return await _controller.ConnectAsync().ConfigureAwait(false);
+                if (_controller == null)
+                {
+                    _controller = new VoiceSessionController(_config, _socket, _playback)
+                    {
+                        HealthProbe = _ => Task.FromResult(true)
+                    };
+                    _viewModel = new VoiceViewModel(_controller);
+                }
+                connectTask = _controller.ConnectAsync();
+            }
+            return await connectTask.ConfigureAwait(false);
         }
 
         public Task<VoiceCommandResult> BeginCaptureAsync()
@@ -225,28 +238,31 @@ namespace Yilan.Voice.Runtime.Bootstrap
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
+            lock (_lifecycleGate)
+            {
+                if (_disposed) return;
+                _disposed = true;
 
-            DisposeObserver?.Invoke("metrics");
-            _metrics.Dispose();
+                DisposeObserver?.Invoke("metrics");
+                _metrics.Dispose();
 
-            DisposeObserver?.Invoke("viewModel");
-            _viewModel?.Dispose();
-            _viewModel = null;
+                DisposeObserver?.Invoke("viewModel");
+                _viewModel?.Dispose();
+                _viewModel = null;
 
-            DisposeObserver?.Invoke("controller");
-            _controller?.Dispose();
-            _controller = null;
+                DisposeObserver?.Invoke("controller");
+                _controller?.Dispose();
+                _controller = null;
 
-            DisposeObserver?.Invoke("playback");
-            _playback.Dispose();
+                DisposeObserver?.Invoke("playback");
+                _playback.Dispose();
 
-            DisposeObserver?.Invoke("microphone");
-            _microphone.Dispose();
+                DisposeObserver?.Invoke("microphone");
+                _microphone.Dispose();
 
-            DisposeObserver?.Invoke("socket");
-            _socket.Dispose();
+                DisposeObserver?.Invoke("socket");
+                _socket.Dispose();
+            }
         }
 
         private void ThrowIfDisposed()

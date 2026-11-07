@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Text;
 using Yilan.Voice.Runtime.Protocol;
 using Yilan.Voice.Runtime.Session;
 
@@ -55,6 +57,8 @@ namespace Yilan.Voice.Runtime.UI
         private const string TtsDegradedHint = "语音播报不可用，已显示文字回答";
 
         private readonly VoiceSessionController _controller;
+        private readonly SortedDictionary<int, string> _streamBlocks = new SortedDictionary<int, string>();
+        private int _streamAttempt;
         private bool _answerFixed;
         private bool _disposed;
 
@@ -99,6 +103,7 @@ namespace Yilan.Voice.Runtime.UI
             _controller = controller ?? throw new ArgumentNullException(nameof(controller));
             _controller.StateChanged += OnStateChanged;
             _controller.AnswerReceived += OnAnswerReceived;
+            _controller.AnswerStreamReceived += OnAnswerStreamReceived;
             _controller.MessageRejected += OnMessageRejected;
             _controller.TranscriptReceived += OnTranscriptReceived;
             _controller.ClarificationRequired += OnClarificationRequired;
@@ -174,8 +179,91 @@ namespace Yilan.Voice.Runtime.UI
             if (_answerFixed) return;
             _answerFixed = true;
             AnswerText = content ?? string.Empty;
+            _streamBlocks.Clear();
+            HintText = string.Empty;
             State = VoiceUiState.AnswerDisplayed;
             RaiseChanged();
+        }
+
+        private void OnAnswerStreamReceived(AnswerEventMessage message)
+        {
+            if (_answerFixed || message == null || message.payload == null) return;
+            AnswerStreamPayload payload = message.payload;
+
+            if (message.event_type == "generation.started")
+            {
+                if (payload.attempt >= _streamAttempt)
+                {
+                    _streamAttempt = payload.attempt;
+                    _streamBlocks.Clear();
+                    AnswerText = string.Empty;
+                }
+                HintText = payload.origin == "recovery" ? "主回答不可用，正在生成备用回答…" : "正在生成回答…";
+            }
+            else if (message.event_type == "progress.updated")
+            {
+                HintText = ProgressHint(payload.stage, payload.status);
+            }
+            else if (message.event_type == "reasoning.delta")
+            {
+                // The protocol may carry model-visible reasoning. Do not place raw reasoning in
+                // the public answer box; only expose a stable progress hint.
+                HintText = "正在分析问题…";
+            }
+            else if (message.event_type == "answer.block")
+            {
+                if (payload.attempt < _streamAttempt) return;
+                _streamAttempt = Math.Max(_streamAttempt, payload.attempt);
+                _streamBlocks[payload.block_id] = payload.text ?? string.Empty;
+                AnswerText = JoinStreamBlocks();
+                State = VoiceUiState.AwaitingAnswer;
+                HintText = "回答生成中…";
+            }
+            else if (message.event_type == "answer.block.invalidated")
+            {
+                if (payload.attempt < _streamAttempt) return;
+                _streamBlocks.Remove(payload.block_id);
+                AnswerText = JoinStreamBlocks();
+                HintText = "正在更新回答…";
+            }
+            else if (message.event_type == "request.failed")
+            {
+                _streamBlocks.Clear();
+                AnswerText = string.Empty;
+                HintText = "本次生成失败，请稍后重试";
+            }
+            else if (message.event_type == "request.cancelled")
+            {
+                _streamBlocks.Clear();
+                AnswerText = string.Empty;
+                HintText = "本次问答已取消";
+            }
+
+            RaiseChanged();
+        }
+
+        private string JoinStreamBlocks()
+        {
+            var builder = new StringBuilder();
+            foreach (KeyValuePair<int, string> item in _streamBlocks)
+            {
+                if (string.IsNullOrEmpty(item.Value)) continue;
+                if (builder.Length > 0) builder.AppendLine();
+                builder.Append(item.Value);
+            }
+            return builder.ToString();
+        }
+
+        private static string ProgressHint(string stage, string status)
+        {
+            if (status == "completed") return "正在整理回答…";
+            switch (stage)
+            {
+                case "retrieval": return "正在查找航空资料…";
+                case "generation": return "正在生成回答…";
+                case "validation": return "正在核对回答…";
+                default: return "正在处理问题…";
+            }
         }
 
         private void OnMessageRejected(VoiceCommandResult result)
@@ -245,6 +333,8 @@ namespace Yilan.Voice.Runtime.UI
             TranscriptText = string.Empty;
             TranscriptIsFinal = false;
             HintText = string.Empty;
+            _streamBlocks.Clear();
+            _streamAttempt = 0;
         }
 
         private void RaiseChanged() => Changed?.Invoke();
@@ -257,6 +347,7 @@ namespace Yilan.Voice.Runtime.UI
             {
                 _controller.StateChanged -= OnStateChanged;
                 _controller.AnswerReceived -= OnAnswerReceived;
+                _controller.AnswerStreamReceived -= OnAnswerStreamReceived;
                 _controller.MessageRejected -= OnMessageRejected;
                 _controller.TranscriptReceived -= OnTranscriptReceived;
                 _controller.ClarificationRequired -= OnClarificationRequired;

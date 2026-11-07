@@ -66,6 +66,42 @@ namespace Yilan.Voice.Remediation
                 order);
         }
 
+        [TestCase(true)]
+        [TestCase(false)]
+        public void StartAsync_DisposedDuringHealthProbe_DoesNotCreateSession(bool healthy)
+        {
+            var probe = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var socket = new FakeVoiceSocket();
+            using var runtime = CreateRuntime(socket, true, out _, out _, out _, _ => probe.Task);
+
+            var startup = runtime.StartAsync();
+            Assert.IsFalse(startup.IsCompleted);
+            runtime.Dispose();
+            probe.SetResult(healthy);
+
+            Assert.AreEqual(VoiceCommandResult.InvalidState, startup.GetAwaiter().GetResult());
+            Assert.AreEqual(0, socket.ConnectCalls, "a disposed runtime must not open a new connection");
+            Assert.IsNull(runtime.Controller);
+            Assert.IsNull(runtime.ViewModel);
+        }
+
+        [Test]
+        public void StartAsync_ProbeThrowsAfterDisposal_DoesNotCreateSession()
+        {
+            var probe = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var socket = new FakeVoiceSocket();
+            using var runtime = CreateRuntime(socket, true, out _, out _, out _, _ => probe.Task);
+
+            var startup = runtime.StartAsync();
+            runtime.Dispose();
+            probe.SetException(new InvalidOperationException("health probe failed"));
+
+            Assert.AreEqual(VoiceCommandResult.InvalidState, startup.GetAwaiter().GetResult());
+            Assert.AreEqual(0, socket.ConnectCalls);
+            Assert.IsNull(runtime.Controller);
+            Assert.IsNull(runtime.ViewModel);
+        }
+
         [Test]
         public void PumpAsync_SendsCapturedFramesUpstreamAsHeaderBinaryPairs()
         {
@@ -193,13 +229,14 @@ namespace Yilan.Voice.Remediation
             bool healthOk,
             out RecordingPlayback playback,
             out UnityMicrophoneSource microphone,
-            out VoiceMetricsRecorder metrics)
+            out VoiceMetricsRecorder metrics,
+            Func<VoiceClientConfig, Task<bool>> healthProbe = null)
         {
             var permission = new PicoMicrophonePermission(new FakePermissionPlatform { Granted = true, CanAskAgain = true });
             microphone = new UnityMicrophoneSource(new FakeMicrophoneDevice(), () => permission.HasPermission);
             playback = new RecordingPlayback();
             metrics = new VoiceMetricsRecorder(new VoiceIdHasher("vrr1-test-salt"), directory: System.IO.Path.GetTempPath(), isDevBuild: () => false);
-            return new VoiceClientRuntime(Cfg, socket, _ => Task.FromResult(healthOk), permission, microphone, playback, metrics);
+            return new VoiceClientRuntime(Cfg, socket, healthProbe ?? (_ => Task.FromResult(healthOk)), permission, microphone, playback, metrics);
         }
 
         private static VoiceClientRuntime CreateRuntime(FakeVoiceSocket socket, bool healthOk)

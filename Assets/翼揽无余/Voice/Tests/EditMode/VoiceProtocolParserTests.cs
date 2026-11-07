@@ -378,5 +378,29 @@ namespace Yilan.Voice.Protocol
             var res = VoiceProtocolParser.Parse(JsonUtility.ToJson(m), binding);
             Assert.AreEqual(VoiceParseCode.BindingMismatch, res.Code, res.Reason);
         }
+
+        [Test]
+        public void AnswerStreamEventV1_ParsesWithCurrentBinding()
+        {
+            const string json = "{\"type\":\"answer.event\",\"schema_version\":1,\"event_type\":\"answer.block\",\"request_id\":\"run-1\",\"session_id\":\"s1\",\"turn_id\":\"t1\",\"sequence\":3,\"payload\":{\"attempt\":1,\"block_id\":1,\"text\":\"候选回答\"}}";
+            var binding = new VoiceBinding { SessionId = "s1", TurnId = "t1" };
+
+            VoiceParseResult result = VoiceProtocolParser.Parse(json, binding);
+
+            Assert.AreEqual(VoiceParseCode.Ok, result.Code, result.Reason);
+            var message = (AnswerEventMessage)result.Message;
+            Assert.AreEqual("answer.block", message.event_type);
+            Assert.AreEqual("候选回答", message.payload.text);
+        }
+
+        [Test]
+        public void AnswerStreamUnknownEventType_IsRejected()
+        {
+            const string json = "{\"type\":\"answer.event\",\"schema_version\":1,\"event_type\":\"request.completed\",\"request_id\":\"run-1\",\"session_id\":\"s1\",\"turn_id\":\"t1\",\"sequence\":4,\"payload\":{}}";
+
+            VoiceParseResult result = VoiceProtocolParser.Parse(json);
+
+            Assert.AreEqual(VoiceParseCode.UnknownType, result.Code, result.Reason);
+        }
     }
 }

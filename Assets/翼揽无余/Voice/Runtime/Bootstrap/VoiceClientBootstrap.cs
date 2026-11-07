@@ -103,17 +103,28 @@ namespace Yilan.Voice.Runtime.Bootstrap
 
         private async void Start()
         {
+            await StartRuntimeAsync();
+        }
+
+        private async Task StartRuntimeAsync()
+        {
             if (!IsValid || _runtime == null) return;
 
-            await _runtime.StartAsync();
-            panel.Bind(_runtime.ViewModel);
+            var runtime = _runtime;
+            await runtime.StartAsync();
+
+            // Scene unload / leaving Play Mode can destroy us while startup is pending.
+            // Check Unity object lifetime as well as the runtime before touching the UI.
+            if (this == null || !ReferenceEquals(_runtime, runtime) || panel == null) return;
+
+            panel.Bind(runtime.ViewModel);
 
             // Barge-in / pause / reconnect / fault must silence the audible channel: the
             // queue-level Cancel() only stops later frames, the clip already sounding on
             // the AudioSource is owned by _ttsPlayer.
-            if (_runtime.Controller != null)
+            if (runtime.Controller != null)
             {
-                _runtime.Controller.StateChanged += OnControllerStateChanged;
+                runtime.Controller.StateChanged += OnControllerStateChanged;
             }
         }
 
@@ -143,6 +154,7 @@ namespace Yilan.Voice.Runtime.Bootstrap
 
         private void OnDestroy()
         {
+            IsValid = false;
             if (_runtime?.Controller != null)
             {
                 _runtime.Controller.StateChanged -= OnControllerStateChanged;

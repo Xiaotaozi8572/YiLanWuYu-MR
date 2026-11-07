@@ -113,7 +113,27 @@ namespace Yilan.Voice.Runtime.UI
                 turn_id = turnId,
                 state = "listening",
                 status = "session.started",
-                protocol_version = VoiceProtocolParser.WireVersion
+                protocol_version = VoiceProtocolParser.WireVersion,
+                accepted_capabilities = new[] { "answer-stream-v1" }
+            });
+
+        private static string AnswerBlockJson(string sessionId, string turnId, int sequence, int blockId, string text)
+            => JsonUtility.ToJson(new AnswerEventMessage
+            {
+                type = "answer.event",
+                schema_version = 1,
+                event_type = "answer.block",
+                request_id = "run-1",
+                session_id = sessionId,
+                turn_id = turnId,
+                sequence = sequence,
+                payload = new AnswerStreamPayload
+                {
+                    attempt = 1,
+                    block_id = blockId,
+                    text = text,
+                    status = "generating"
+                }
             });
 
         private static string AnswerJson(string sessionId, string turnId, string content, string answerId = "ans-1")
@@ -234,6 +254,32 @@ namespace Yilan.Voice.Runtime.UI
             Assert.AreEqual(content, vm.AnswerText);
             Assert.IsTrue(vm.AnswerFixed, "answer must be fixed once for the current turn");
 
+            c.Dispose();
+            vm.Dispose();
+            s.Dispose();
+        }
+
+        [Test]
+        public void Ui_StreamingBlocks_AppearBeforeFinal_ThenFinalReplacesCandidate()
+        {
+            var (c, s, vm) = NewHarness();
+            ConnectToReady(c, s);
+            c.RecordStartAsync();
+            c.RecordEndAsync();
+
+            s.SimulatePayload(AnswerBlockJson(c.SessionId, c.TurnId, 1, 1, "候选第一段。"));
+            s.SimulatePayload(AnswerBlockJson(c.SessionId, c.TurnId, 2, 2, "候选第二段。"));
+            s.DispatchMessageQueue();
+
+            Assert.AreEqual("候选第一段。" + Environment.NewLine + "候选第二段。", vm.AnswerText);
+            Assert.IsFalse(vm.AnswerFixed);
+
+            s.SimulatePayload(AnswerJson(c.SessionId, c.TurnId, "最终校准回答。"));
+            s.DispatchMessageQueue();
+
+            Assert.AreEqual("最终校准回答。", vm.AnswerText);
+            Assert.IsTrue(vm.AnswerFixed);
+            Assert.AreEqual(VoiceUiState.AnswerDisplayed, vm.State);
             c.Dispose();
             vm.Dispose();
             s.Dispose();

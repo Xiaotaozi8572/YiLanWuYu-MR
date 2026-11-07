@@ -47,6 +47,7 @@ namespace Yilan.Voice.Runtime.Bootstrap
             ConfigureCanvas();
 
             SceneManager.sceneLoaded += OnSceneLoaded;
+            SceneManager.activeSceneChanged += OnActiveSceneChanged;
             StartBinding();
         }
 
@@ -58,10 +59,16 @@ namespace Yilan.Voice.Runtime.Bootstrap
             }
 
             SceneManager.sceneLoaded -= OnSceneLoaded;
+            SceneManager.activeSceneChanged -= OnActiveSceneChanged;
             _instance = null;
         }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+        {
+            StartBinding();
+        }
+
+        private void OnActiveSceneChanged(Scene previous, Scene current)
         {
             StartBinding();
         }
@@ -84,8 +91,7 @@ namespace Yilan.Voice.Runtime.Bootstrap
             // VoicePanelAnchor is the explicit per-scene opt-in for displaying the assistant.
             for (int frame = 0; frame < 120; frame++)
             {
-                _currentAnchor =
-                    FindObjectOfType<VoicePanelAnchor>(true);
+                _currentAnchor = FindAnchorForActiveScene();
 
                 if (_currentAnchor != null)
                 {
@@ -102,6 +108,25 @@ namespace Yilan.Voice.Runtime.Bootstrap
             SetCanvasVisible(false);
 
             _bindingRoutine = null;
+        }
+
+        private static VoicePanelAnchor FindAnchorForActiveScene()
+        {
+            Scene activeScene = SceneManager.GetActiveScene();
+            VoicePanelAnchor[] anchors = FindObjectsOfType<VoicePanelAnchor>(true);
+            foreach (VoicePanelAnchor anchor in anchors)
+            {
+                if (anchor == null
+                    || !anchor.isActiveAndEnabled
+                    || !anchor.ShowAssistant
+                    || !anchor.gameObject.scene.isLoaded
+                    || anchor.gameObject.scene != activeScene)
+                {
+                    continue;
+                }
+                return anchor;
+            }
+            return null;
         }
 
         private void LateUpdate()
