@@ -41,6 +41,10 @@ namespace Yilan.Voice.Runtime.Session
         public int SendTimeoutMs = 5000;
         public int HealthProbeTimeoutMs = 5000;   // mirrors VoiceHealthClient.DefaultTimeoutMs
         public int ReconnectDelayMs = 2000;
+        [Tooltip("Maximum technical wait for final TTS payload, decode, and local AudioSource drain.")]
+        // Covers synthesis/transport plus the longest configured spoken answer (30 s)
+        // and local playback. A 30 s deadline from answer.display cut off valid audio.
+        public int PlaybackCompletionTimeoutMs = 90000;
 
         [Tooltip("Maximum time to wait for barge_in.accepted before a cancel settles locally.")]
         public int CancelAckTimeoutMs = 2000;

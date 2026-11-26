@@ -15,7 +15,7 @@ namespace Yilan.Voice.Editor
     public static class VoiceBuild
     {
         // Absolute output path for the Development APK (repo tmp dir).
-        private const string OutputApkPath = @"D:\APP\Python 3.13\挑战杯\tmp\voice-vr\PicoVoice.apk";
+        private const string OutputApkPath = @"E:\BaiduNetdiskDownload\挑战杯\tmp\voice-vr\PicoVoice.apk";
 
         // The single integration scene explicitly passed to BuildPlayer.
         private const string IntegrationScenePath = @"Assets/翼揽无余/Voice/Scenes/PicoVoiceIntegrationTest.unity";
@@ -46,6 +46,7 @@ namespace Yilan.Voice.Editor
             // The development build must be a plain APK (not Android App Bundle).
             EditorUserBuildSettings.buildAppBundle = false;
 
+            Directory.CreateDirectory(Path.GetDirectoryName(OutputApkPath));
             Debug.Log($"[VoiceBuild] Building Development APK -> {OutputApkPath}");
             Debug.Log($"[VoiceBuild] scenes: {string.Join(", ", scenes)}");
 

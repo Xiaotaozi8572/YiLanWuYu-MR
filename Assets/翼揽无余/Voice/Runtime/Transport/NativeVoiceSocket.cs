@@ -37,11 +37,9 @@ namespace Yilan.Voice.Runtime.Transport
         public const int DefaultTimeoutMs = 8000;
 
         private readonly object _gate = new object();
-        private NativeWebSocket.WebSocket _socket;
-        private TaskCompletionSource<bool> _openTcs;
+        private _ConnectionGeneration _connection;
+        private int _nextGeneration;
         private bool _disposed;
-        private bool _closedFired;      // dedupe server close event
-        private bool _userClosePending; // suppress our own close echo
 
         // Strict-FIFO outgoing pump (see class doc: the library's split text/binary queues
         // reorder header+body pairs; this outbox restores global send order).
@@ -51,6 +49,7 @@ namespace Yilan.Voice.Runtime.Transport
 
         private sealed class _OutboxItem
         {
+            public _ConnectionGeneration Connection;
             public bool IsText;
             public string Text;      // set when IsText
             public byte[] Binary;    // set when !IsText
@@ -59,6 +58,30 @@ namespace Yilan.Voice.Runtime.Transport
             public volatile string FailReason;
             public readonly TaskCompletionSource<bool> Done =
                 new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        /// <summary>All callback and wait state belongs to exactly one native object.</summary>
+        private sealed class _ConnectionGeneration
+        {
+            public readonly int Id;
+            public readonly NativeWebSocket.WebSocket Socket;
+            public readonly TaskCompletionSource<bool> Opened =
+                new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            public readonly TaskCompletionSource<bool> Closed =
+                new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            public NativeWebSocket.WebSocketOpenEventHandler OnOpen;
+            public NativeWebSocket.WebSocketMessageEventHandler OnMessage;
+            public NativeWebSocket.WebSocketErrorEventHandler OnError;
+            public NativeWebSocket.WebSocketCloseEventHandler OnClose;
+            public volatile bool Retired;
+            public bool ClosedFired;
+            public bool UserClosePending;
+
+            public _ConnectionGeneration(int id, NativeWebSocket.WebSocket socket)
+            {
+                Id = id;
+                Socket = socket;
+            }
         }
 
         public event VoiceSocketOpenedHandler Opened;
@@ -75,7 +98,8 @@ namespace Yilan.Voice.Runtime.Transport
             {
                 lock (_gate)
                 {
-                    return _socket != null && _socket.State == NativeWebSocket.WebSocketState.Open;
+                    return _connection != null && !_connection.Retired &&
+                           _connection.Socket.State == NativeWebSocket.WebSocketState.Open;
                 }
             }
         }
@@ -91,9 +115,10 @@ namespace Yilan.Voice.Runtime.Transport
 
         public void DispatchMessageQueue()
         {
-            NativeWebSocket.WebSocket s;
-            lock (_gate) { s = _socket; }
-            s?.DispatchMessageQueue();
+            _ConnectionGeneration connection;
+            lock (_gate) { connection = _connection; }
+            if (connection != null && !connection.Retired)
+                connection.Socket.DispatchMessageQueue();
         }
 
         public async Task ConnectAsync(Uri url, int timeoutMs = 0)
@@ -101,79 +126,86 @@ namespace Yilan.Voice.Runtime.Transport
             if (url == null) throw new ArgumentNullException(nameof(url));
             int timeout = timeoutMs > 0 ? timeoutMs : DefaultTimeoutMs;
 
-            TaskCompletionSource<bool> tcs;
+            _ConnectionGeneration connection;
             lock (_gate)
             {
                 ThrowIfDisposedLocked();
-                _openTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                tcs = _openTcs;
-                CreateAndSubscribeLocked(url);
+                if (_connection != null && !_connection.Retired)
+                    throw new InvalidOperationException("A native socket generation is already active.");
+                connection = CreateAndSubscribeLocked(url);
             }
 
             // Fire-and-forget connect; open is signalled by the OnOpen handler through tcs.
-            _ = _socket.Connect();
+            _ = connection.Socket.Connect();
 
             var deadline = DateTime.UtcNow.AddMilliseconds(timeout);
-            while (!tcs.Task.IsCompleted)
+            while (!connection.Opened.Task.IsCompleted)
             {
                 if (DateTime.UtcNow >= deadline)
                 {
-                    RaiseError(VoiceSocketErrorKind.Timeout, "connect timeout");
-                    await QuietAbortAsync();
+                    RaiseError(connection, VoiceSocketErrorKind.Timeout, "connect timeout");
+                    await QuietAbortAsync(connection);
                     return;
                 }
-                _socket.DispatchMessageQueue();
+                if (!connection.Retired)
+                    connection.Socket.DispatchMessageQueue();
                 await Task.Delay(5).ConfigureAwait(false);
             }
 
-            await tcs.Task.ConfigureAwait(false);
-            LogState("connected", $"state={_socket.State}");
+            if (!await connection.Opened.Task.ConfigureAwait(false))
+                throw new InvalidOperationException("Native socket closed before opening.");
+            if (connection.Retired)
+                throw new InvalidOperationException("Native socket generation was retired.");
+            LogState("connected", $"generation={connection.Id} state={connection.Socket.State}");
         }
 
         public async Task SendTextAsync(string text, int timeoutMs = 0)
         {
             int timeout = timeoutMs > 0 ? timeoutMs : DefaultTimeoutMs;
-            NativeWebSocket.WebSocket s;
-            lock (_gate) { s = _socket; }
+            _ConnectionGeneration connection;
+            lock (_gate) { connection = _connection; }
 
-            if (s == null || !IsOpen)
+            if (connection == null || connection.Retired ||
+                connection.Socket.State != NativeWebSocket.WebSocketState.Open)
             {
-                RaiseError(VoiceSocketErrorKind.InvalidState, "send text: socket not open");
+                RaiseError(connection, VoiceSocketErrorKind.InvalidState, "send text: socket not open");
                 return;
             }
 
-            bool ok = await EnqueueOutbox(true, text ?? string.Empty, null, timeout).ConfigureAwait(false);
+            bool ok = await EnqueueOutbox(connection, true, text ?? string.Empty, null, timeout).ConfigureAwait(false);
             if (ok) LogState("send-text", $"bytes={(text ?? string.Empty).Length}");
         }
 
         public async Task SendBinaryAsync(byte[] data, int timeoutMs = 0)
         {
             int timeout = timeoutMs > 0 ? timeoutMs : DefaultTimeoutMs;
-            NativeWebSocket.WebSocket s;
-            lock (_gate) { s = _socket; }
+            _ConnectionGeneration connection;
+            lock (_gate) { connection = _connection; }
 
-            if (s == null || !IsOpen)
+            if (connection == null || connection.Retired ||
+                connection.Socket.State != NativeWebSocket.WebSocketState.Open)
             {
-                RaiseError(VoiceSocketErrorKind.InvalidState, "send binary: socket not open");
+                RaiseError(connection, VoiceSocketErrorKind.InvalidState, "send binary: socket not open");
                 return;
             }
 
-            bool ok = await EnqueueOutbox(false, null, data ?? Array.Empty<byte>(), timeout).ConfigureAwait(false);
+            bool ok = await EnqueueOutbox(connection, false, null, data ?? Array.Empty<byte>(), timeout).ConfigureAwait(false);
             if (ok) LogState("send-binary", $"bytes={(data?.Length ?? 0)}");
         }
 
         public async Task CloseAsync(int code, string reason, int timeoutMs = 0)
         {
             int timeout = timeoutMs > 0 ? timeoutMs : DefaultTimeoutMs;
-            NativeWebSocket.WebSocket s;
+            _ConnectionGeneration connection;
             lock (_gate)
             {
                 if (_disposed) return; // idempotent no-op after dispose
-                _userClosePending = true;
-                s = _socket;
+                connection = _connection;
+                if (connection != null) connection.UserClosePending = true;
             }
 
-            if (s == null || !IsOpen)
+            if (connection == null || connection.Retired ||
+                connection.Socket.State != NativeWebSocket.WebSocketState.Open)
             {
                 LogState("close", "already closed (no-op)");
                 return;
@@ -181,52 +213,57 @@ namespace Yilan.Voice.Runtime.Transport
 
             try
             {
-                var close = s.Close((NativeWebSocket.WebSocketCloseCode)code, reason ?? string.Empty);
-                await WaitOrTimeoutAsync(close, timeout, VoiceSocketErrorKind.Unexpected, "close");
-                LogState("close", $"code={code}");
+                var close = connection.Socket.Close((NativeWebSocket.WebSocketCloseCode)code, reason ?? string.Empty);
+                await WaitOrTimeoutAsync(
+                    connection, close, timeout, VoiceSocketErrorKind.Unexpected, "close");
+                var deadline = DateTime.UtcNow.AddMilliseconds(timeout);
+                while (!connection.Closed.Task.IsCompleted && !connection.Retired &&
+                       DateTime.UtcNow < deadline)
+                {
+                    connection.Socket.DispatchMessageQueue();
+                    await Task.Delay(5).ConfigureAwait(false);
+                }
+                if (!connection.Closed.Task.IsCompleted)
+                {
+                    RaiseError(connection, VoiceSocketErrorKind.Timeout, "close notification timeout");
+                    await QuietAbortAsync(connection);
+                }
+                LogState("close", $"generation={connection.Id} code={code}");
             }
             catch (Exception ex)
             {
-                RaiseError(VoiceSocketErrorKind.Unexpected, "close failed: " + ex.GetType().Name);
+                RaiseError(connection, VoiceSocketErrorKind.Unexpected, "close failed: " + ex.GetType().Name);
+                await QuietAbortAsync(connection);
             }
             finally
             {
-                lock (_gate) { _userClosePending = false; }
+                lock (_gate) { connection.UserClosePending = false; }
             }
         }
 
         public void Dispose()
         {
-            NativeWebSocket.WebSocket s;
+            _ConnectionGeneration connection;
             lock (_gate)
             {
                 if (_disposed) return;
                 _disposed = true;
-                _userClosePending = true;
-                s = _socket;
-                _socket = null;
+                connection = _connection;
+                _connection = null;
+                if (connection != null)
+                    RetireGenerationLocked(connection, "disposed");
             }
 
-            if (s != null)
+            if (connection != null)
             {
-                try { s.CancelConnection(); } catch { }
+                try { connection.Socket.CancelConnection(); } catch { }
                 // NativeWebSocket.WebSocket disposes its inner ClientWebSocket internally; there is
                 // no public Dispose on the adapter, so cancelling the connection is sufficient.
             }
 
-            // Fail any queued outbox sends so their awaiters do not hang.
-            lock (_outboxLock)
-            {
-                while (_outbox.Count > 0)
-                {
-                    var item = _outbox.Dequeue();
-                    item.FailReason = "disposed";
-                    item.Done.TrySetResult(false);
-                }
-            }
+            FailOutbox(connection, "disposed", all: true);
 
             // Unsubscribe every callback so nothing reaches a destroyed consumer.
-            _openTcs = null;
             Opened = null;
             Payload = null;
             Error = null;
@@ -236,46 +273,135 @@ namespace Yilan.Voice.Runtime.Transport
 
         // ---------------- internals ----------------
 
-        private void CreateAndSubscribeLocked(Uri url)
+        private _ConnectionGeneration CreateAndSubscribeLocked(Uri url)
         {
             var s = new NativeWebSocket.WebSocket(url.ToString());
-            s.OnOpen += () =>
+            var previous = _connection;
+            if (previous != null)
             {
-                lock (_gate)
+                RetireGenerationLocked(previous, "replaced");
+                FailOutbox(previous, "connection replaced");
+            }
+
+            var connection = new _ConnectionGeneration(++_nextGeneration, s);
+            _connection = connection;
+            connection.OnOpen = () => HandleOpen(connection);
+            connection.OnMessage = bytes => HandleMessage(connection, bytes);
+            connection.OnError = msg => HandleError(connection, msg);
+            connection.OnClose = code => HandleClose(connection, (int)code);
+            s.OnOpen += connection.OnOpen;
+            s.OnMessage += connection.OnMessage;
+            s.OnError += connection.OnError;
+            s.OnClose += connection.OnClose;
+            return connection;
+        }
+
+        private void HandleOpen(_ConnectionGeneration connection)
+        {
+            lock (_gate)
+            {
+                if (_disposed || !ReferenceEquals(_connection, connection) || connection.Retired)
+                    return;
+                connection.Opened.TrySetResult(true);
+            }
+            LogState("on-open", $"generation={connection.Id}");
+            Opened?.Invoke();
+        }
+
+        private void HandleMessage(_ConnectionGeneration connection, byte[] bytes)
+        {
+            lock (_gate)
+            {
+                if (_disposed || !ReferenceEquals(_connection, connection) || connection.Retired)
+                    return;
+            }
+            // Raw bytes are forwarded only from the current native object.
+            LogState("on-payload", $"generation={connection.Id} bytes={bytes?.Length ?? 0}");
+            Payload?.Invoke(bytes ?? Array.Empty<byte>());
+        }
+
+        private void HandleError(_ConnectionGeneration connection, string message)
+        {
+            lock (_gate)
+            {
+                if (_disposed || !ReferenceEquals(_connection, connection) || connection.Retired)
+                    return;
+            }
+            // Native error text may contain endpoint details; do not forward it.
+            LogState("on-error", $"generation={connection.Id}");
+            RaiseError(connection, VoiceSocketErrorKind.Unexpected, "native socket error");
+        }
+
+        private void HandleClose(_ConnectionGeneration connection, int codeValue)
+        {
+            bool userClose;
+            lock (_gate)
+            {
+                if (_disposed || !ReferenceEquals(_connection, connection) ||
+                    connection.Retired || connection.ClosedFired)
+                    return;
+                connection.ClosedFired = true;
+                connection.Retired = true;
+                userClose = connection.UserClosePending;
+                connection.Opened.TrySetResult(false);
+                connection.Closed.TrySetResult(true);
+            }
+            Unsubscribe(connection);
+            FailOutbox(connection, "connection closed");
+            if (!userClose)
+                LogState("on-close", $"generation={connection.Id} code={codeValue} category={VoiceCloseMapper.Classify(codeValue)}");
+            Closed?.Invoke(new VoiceCloseInfo(codeValue, VoiceCloseMapper.Classify(codeValue), null));
+        }
+
+        private void RetireGenerationLocked(_ConnectionGeneration connection, string reason)
+        {
+            if (connection == null || connection.Retired) return;
+            connection.Retired = true;
+            connection.Opened.TrySetResult(false);
+            connection.Closed.TrySetResult(true);
+            Unsubscribe(connection);
+            LogState("generation-retired", $"generation={connection.Id} reason={reason}");
+        }
+
+        private void FailOutbox(_ConnectionGeneration connection, string reason, bool all = false)
+        {
+            lock (_outboxLock)
+            {
+                FailQueuedLocked(connection, reason, all);
+                if (_outbox.Count == 0 && !_pumpRunning)
+                    _pumpRunning = false;
+            }
+        }
+
+        private void FailQueuedLocked(_ConnectionGeneration connection, string reason, bool all = false)
+        {
+            if (_outbox.Count == 0) return;
+            var remaining = new Queue<_OutboxItem>();
+            while (_outbox.Count > 0)
+            {
+                var item = _outbox.Dequeue();
+                if (all || ReferenceEquals(item.Connection, connection))
                 {
-                    _openTcs?.TrySetResult(true);
+                    item.FailReason = reason;
+                    item.Done.TrySetResult(false);
                 }
-                LogState("on-open", null);
-                Opened?.Invoke();
-            };
-            s.OnMessage += bytes =>
-            {
-                // Raw bytes, verbatim. Text/binary judgement is left to the protocol's
-                // pending state; never decode or sniff here.
-                LogState("on-payload", $"bytes={bytes?.Length ?? 0}");
-                Payload?.Invoke(bytes ?? Array.Empty<byte>());
-            };
-            s.OnError += msg =>
-            {
-                // The underlying message may embed host details; log only the classification.
-                LogState("on-error", null);
-                RaiseError(VoiceSocketErrorKind.Unexpected, "native socket error");
-            };
-            s.OnClose += code =>
-            {
-                int codeValue = (int)code;
-                bool userClose;
-                lock (_gate)
+                else
                 {
-                    if (_closedFired) return;
-                    _closedFired = true;
-                    userClose = _userClosePending;
+                    remaining.Enqueue(item);
                 }
-                if (!userClose)
-                    LogState("on-close", $"code={codeValue} category={VoiceCloseMapper.Classify(codeValue)}");
-                Closed?.Invoke(new VoiceCloseInfo(codeValue, VoiceCloseMapper.Classify(codeValue), null));
-            };
-            _socket = s;
+            }
+            while (remaining.Count > 0) _outbox.Enqueue(remaining.Dequeue());
+        }
+
+        private static void Unsubscribe(_ConnectionGeneration connection)
+        {
+            if (connection == null) return;
+            // NativeWebSocket exposes events but not a bulk unsubscribe. Subscriptions use
+            // named delegates below so retirement can detach the exact generation handlers.
+            connection.Socket.OnOpen -= connection.OnOpen;
+            connection.Socket.OnMessage -= connection.OnMessage;
+            connection.Socket.OnError -= connection.OnError;
+            connection.Socket.OnClose -= connection.OnClose;
         }
 
         // ---------------- strict-FIFO outbox ----------------
@@ -285,10 +411,12 @@ namespace Yilan.Voice.Runtime.Transport
         /// completes with true when the message was handed to the library and its send
         /// completed, false on failure/timeout/dispose.
         /// </summary>
-        private Task<bool> EnqueueOutbox(bool isText, string text, byte[] binary, int timeoutMs)
+        private Task<bool> EnqueueOutbox(
+            _ConnectionGeneration connection, bool isText, string text, byte[] binary, int timeoutMs)
         {
             var item = new _OutboxItem
             {
+                Connection = connection,
                 IsText = isText,
                 Text = text,
                 Binary = binary,
@@ -297,9 +425,9 @@ namespace Yilan.Voice.Runtime.Transport
 
             lock (_outboxLock)
             {
-                if (_disposed)
+                if (_disposed || connection == null || connection.Retired)
                 {
-                    item.FailReason = "disposed";
+                    item.FailReason = _disposed ? "disposed" : "connection retired";
                     item.Done.TrySetResult(false);
                     return item.Done.Task;
                 }
@@ -348,28 +476,26 @@ namespace Yilan.Voice.Runtime.Transport
                 {
                     lock (_outboxLock)
                     {
-                        _pumpRunning = false;
-                        while (_outbox.Count > 0)
+                        FailQueuedLocked(item.Connection, "send aborted");
+                        if (_outbox.Count == 0)
                         {
-                            var dropped = _outbox.Dequeue();
-                            dropped.FailReason = "send aborted";
-                            dropped.Done.TrySetResult(false);
+                            _pumpRunning = false;
+                            return;
                         }
                     }
-                    return;
                 }
             }
         }
 
         private async Task<bool> SendOutboxItemAsync(_OutboxItem item)
         {
-            NativeWebSocket.WebSocket s;
-            lock (_gate) { s = _socket; }
+            _ConnectionGeneration connection = item.Connection;
+            NativeWebSocket.WebSocket s = connection?.Socket;
 
-            if (s == null || s.State != NativeWebSocket.WebSocketState.Open)
+            if (s == null || connection.Retired || s.State != NativeWebSocket.WebSocketState.Open)
             {
                 item.FailReason = "socket not open";
-                RaiseError(VoiceSocketErrorKind.InvalidState, "send: socket not open");
+                RaiseError(connection, VoiceSocketErrorKind.InvalidState, "send: socket not open");
                 item.Done.TrySetResult(false);
                 return false;
             }
@@ -379,7 +505,7 @@ namespace Yilan.Voice.Runtime.Transport
                 Task send = item.IsText
                     ? s.SendText(item.Text ?? string.Empty)
                     : s.Send(item.Binary ?? Array.Empty<byte>());
-                await WaitOrTimeoutAsync(send, item.TimeoutMs, VoiceSocketErrorKind.Send,
+                await WaitForSendAsync(connection, send, item.TimeoutMs,
                     item.IsText ? "send text" : "send binary").ConfigureAwait(false);
                 item.Succeeded = true;
                 item.Done.TrySetResult(true);
@@ -396,14 +522,16 @@ namespace Yilan.Voice.Runtime.Transport
             catch (Exception ex)
             {
                 item.FailReason = "send failed: " + ex.GetType().Name;
-                RaiseError(VoiceSocketErrorKind.Send,
+                RaiseError(connection, VoiceSocketErrorKind.Send,
                     (item.IsText ? "send text" : "send binary") + " failed: " + ex.GetType().Name);
                 item.Done.TrySetResult(false);
                 return false;
             }
         }
 
-        private async Task WaitOrTimeoutAsync(Task op, int timeoutMs, VoiceSocketErrorKind kind, string what)
+        private async Task WaitOrTimeoutAsync(
+            _ConnectionGeneration connection, Task op, int timeoutMs,
+            VoiceSocketErrorKind kind, string what)
         {
             if (op.IsCompleted)
             {
@@ -414,24 +542,49 @@ namespace Yilan.Voice.Runtime.Transport
             var done = await Task.WhenAny(op, delay).ConfigureAwait(false);
             if (done != op)
             {
-                RaiseError(VoiceSocketErrorKind.Timeout, what + " timeout");
+                RaiseError(connection, VoiceSocketErrorKind.Timeout, what + " timeout");
                 throw new TimeoutException(what + " timed out");
             }
             await op.ConfigureAwait(false);
         }
 
-        private async Task QuietAbortAsync()
+        private async Task WaitForSendAsync(
+            _ConnectionGeneration connection, Task op, int timeoutMs, string what)
         {
-            NativeWebSocket.WebSocket s;
-            lock (_gate) { s = _socket; }
-            if (s == null) return;
-            try { s.CancelConnection(); } catch { }
+            if (op.IsCompleted)
+            {
+                await op.ConfigureAwait(false);
+                return;
+            }
+            var delay = Task.Delay(timeoutMs);
+            var done = await Task.WhenAny(op, connection.Closed.Task, delay).ConfigureAwait(false);
+            if (done == connection.Closed.Task)
+                throw new InvalidOperationException("connection generation closed during " + what);
+            if (done != op)
+            {
+                RaiseError(connection, VoiceSocketErrorKind.Timeout, what + " timeout");
+                throw new TimeoutException(what + " timed out");
+            }
+            await op.ConfigureAwait(false);
+        }
+
+        private async Task QuietAbortAsync(_ConnectionGeneration connection)
+        {
+            if (connection == null) return;
+            lock (_gate)
+            {
+                RetireGenerationLocked(connection, "quiet-abort");
+                if (ReferenceEquals(_connection, connection)) _connection = null;
+            }
+            FailOutbox(connection, "connection aborted");
+            try { connection.Socket.CancelConnection(); } catch { }
             await Task.CompletedTask;
         }
 
-        private void RaiseError(VoiceSocketErrorKind kind, string message)
+        private void RaiseError(_ConnectionGeneration connection, VoiceSocketErrorKind kind, string message)
         {
-            LogState("error", $"kind={kind}");
+            if (connection != null && connection.Retired) return;
+            LogState("error", $"generation={connection?.Id ?? 0} kind={kind}");
             Error?.Invoke(new VoiceSocketError(kind, message));
         }
 

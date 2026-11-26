@@ -1131,7 +1131,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   panel: {fileID: 4107666323287412686}
   audioSource: {fileID: 3783577514481557589}
-  wsHost: 172.20.10.2
+  wsHost: 172.20.10.5
   wsPort: 8765
   wsPath: /ws/voice/session
   maxFramesPerUpdate: 4

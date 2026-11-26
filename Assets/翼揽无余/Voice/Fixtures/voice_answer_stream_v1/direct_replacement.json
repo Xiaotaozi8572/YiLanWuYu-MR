@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "scenario": "primary candidate is retracted before one Qwen direct answer streams",
+  "events": [
+    {"type":"answer.event","schema_version":1,"event_type":"generation.started","request_id":"run-direct","session_id":"stream-s1","turn_id":"t1","sequence":1,"payload":{"attempt":1,"origin":"primary","reason":"initial"}},
+    {"type":"answer.event","schema_version":1,"event_type":"reasoning.delta","request_id":"run-direct","session_id":"stream-s1","turn_id":"t1","sequence":2,"payload":{"attempt":1,"text":"旧主答思考。"}},
+    {"type":"answer.event","schema_version":1,"event_type":"answer.block","request_id":"run-direct","session_id":"stream-s1","turn_id":"t1","sequence":3,"payload":{"attempt":1,"block_id":1,"text":"旧主答候选。","evidence_ids":[],"status":"generating","citations":[]}},
+    {"type":"answer.event","schema_version":1,"event_type":"answer.block.invalidated","request_id":"run-direct","session_id":"stream-s1","turn_id":"t1","sequence":4,"payload":{"attempt":1,"block_id":1,"reason":"replaced"}},
+    {"type":"answer.event","schema_version":1,"event_type":"generation.started","request_id":"run-direct","session_id":"stream-s1","turn_id":"t1","sequence":5,"payload":{"attempt":2,"origin":"recovery","reason":"primary_unavailable"}},
+    {"type":"answer.event","schema_version":1,"event_type":"reasoning.delta","request_id":"run-direct","session_id":"stream-s1","turn_id":"t1","sequence":6,"payload":{"attempt":2,"text":"Qwen直答可见思考。"}},
+    {"type":"answer.event","schema_version":1,"event_type":"answer.block","request_id":"run-direct","session_id":"stream-s1","turn_id":"t1","sequence":7,"payload":{"attempt":2,"block_id":2,"text":"Qwen直答新正文。","evidence_ids":[],"status":"generating","citations":[]}}
+  ],
+  "final": {"type":"answer.display","session_id":"stream-s1","turn_id":"t1","answer_id":"answer-direct","evidence_package_id":null,"answer":{"answer_id":"answer-direct","main_answer":"Qwen直答新正文。","content":"Qwen直答新正文。","source":""},"stream":{"schema_version":1,"request_id":"run-direct","sequence":8,"attempt":2,"origin":"recovery","reasoning_available":true,"citations":[]}}
+}

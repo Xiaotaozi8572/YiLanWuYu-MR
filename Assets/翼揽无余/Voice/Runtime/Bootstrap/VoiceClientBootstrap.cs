@@ -24,7 +24,10 @@ namespace Yilan.Voice.Runtime.Bootstrap
         [SerializeField] private int maxFramesPerUpdate = 4;
 
         private VoiceClientRuntime _runtime;
+        private VoiceSessionController _observedController;
         private UnityTtsAudioPlayer _ttsPlayer;
+        private Mp3PlaybackQueue _playbackQueue;
+        private string _pendingFailureHint;
         private bool _pumpInFlight;
 
         public bool IsValid { get; private set; }
@@ -49,7 +52,7 @@ namespace Yilan.Voice.Runtime.Bootstrap
 
             var permission = new PicoMicrophonePermission(new AndroidMicrophonePermissionPlatform());
             var microphone = new UnityMicrophoneSource(new UnityMicrophoneDevice(), () => permission.HasPermission);
-            var playback = new Mp3PlaybackQueue(new UnityMp3Decoder());
+            _playbackQueue = new Mp3PlaybackQueue(new UnityMp3Decoder(config.PlaybackCompletionTimeoutMs));
             var metrics = new VoiceMetricsRecorder(VoiceIdHasher.CreateRandomSalt());
             _runtime = new VoiceClientRuntime(
                 config,
@@ -57,13 +60,17 @@ namespace Yilan.Voice.Runtime.Bootstrap
                 ProbeHealthAsync,
                 permission,
                 microphone,
-                playback,
+                _playbackQueue,
                 metrics);
 
             // P0-5: bridge decoded TTS clips onto the AudioSource. Mp3PlaybackQueue only
             // decodes; without this subscription the clips were silently dropped.
             _ttsPlayer = new UnityTtsAudioPlayer(audioSource);
-            playback.FramePlayed += OnTtsFramePlayed;
+            _ttsPlayer.PlaybackDrained += OnTtsPlaybackDrained;
+            _ttsPlayer.PlaybackFailed += OnTtsPlayerFailed;
+            _playbackQueue.FramePlayed += OnTtsFramePlayed;
+            _playbackQueue.FrameDecodeFailed += OnPlaybackDecodeFailed;
+            _playbackQueue.PlaybackFailed += OnPlaybackFailed;
 
             // P0-2: visible recording entry. The panel only raises intents; the actions
             // here are the single place that drives the runtime from UI input.
@@ -111,29 +118,67 @@ namespace Yilan.Voice.Runtime.Bootstrap
             if (!IsValid || _runtime == null) return;
 
             var runtime = _runtime;
-            await runtime.StartAsync();
+            panel.ShowStartupStatus("正在连接语音服务…");
+            VoiceCommandResult result;
+            try
+            {
+                result = await runtime.StartAsync();
+            }
+            catch (Exception exception)
+            {
+                if (this == null || !ReferenceEquals(_runtime, runtime) || panel == null) return;
+                panel.ShowStartupStatus("语音服务连接失败", "启动异常：" + exception.GetType().Name);
+                Debug.LogError("[Yilan.Voice] 语音服务启动失败: " + exception);
+                return;
+            }
 
             // Scene unload / leaving Play Mode can destroy us while startup is pending.
             // Check Unity object lifetime as well as the runtime before touching the UI.
             if (this == null || !ReferenceEquals(_runtime, runtime) || panel == null) return;
 
-            panel.Bind(runtime.ViewModel);
-
-            // Barge-in / pause / reconnect / fault must silence the audible channel: the
-            // queue-level Cancel() only stops later frames, the clip already sounding on
-            // the AudioSource is owned by _ttsPlayer.
-            if (runtime.Controller != null)
+            BindRuntimeUi(runtime);
+            if (runtime.ViewModel == null || result != VoiceCommandResult.Ok)
             {
-                runtime.Controller.StateChanged += OnControllerStateChanged;
+                string hint = "请检查眼镜网络和服务器地址（" + result + "）";
+                if (runtime.ViewModel != null) runtime.ViewModel.ShowHint(hint);
+                else panel.ShowStartupStatus("语音服务连接失败", hint);
             }
+        }
+
+        private void BindRuntimeUi(VoiceClientRuntime runtime)
+        {
+            if (runtime.ViewModel != null && !ReferenceEquals(panel.ViewModel, runtime.ViewModel))
+                panel.Bind(runtime.ViewModel);
+
+            if (ReferenceEquals(_observedController, runtime.Controller)) return;
+            if (_observedController != null)
+            {
+                _observedController.StateChanged -= OnControllerStateChanged;
+                _observedController.FaultReasonChanged -= OnControllerFaultReasonChanged;
+                _observedController.PlaybackFailureReported -= OnPlaybackFailureReported;
+                _observedController.TtsDegraded -= OnControllerTtsDegraded;
+            }
+            _observedController = runtime.Controller;
+            if (_observedController == null) return;
+            _observedController.StateChanged += OnControllerStateChanged;
+            _observedController.FaultReasonChanged += OnControllerFaultReasonChanged;
+            _observedController.PlaybackFailureReported += OnPlaybackFailureReported;
+            _observedController.TtsDegraded += OnControllerTtsDegraded;
         }
 
         private void Update()
         {
             if (!IsValid || _runtime == null) return;
 
+            BindRuntimeUi(_runtime);
             _runtime.Socket?.DispatchMessageQueue();
             _ttsPlayer?.Tick();
+            _runtime.Controller?.TickPlaybackDeadline();
+            if (!string.IsNullOrEmpty(_pendingFailureHint) && _runtime.ViewModel != null)
+            {
+                _runtime.ViewModel.ShowHint(_pendingFailureHint);
+                _pendingFailureHint = null;
+            }
             _ = PumpGuardedAsync();
         }
 
@@ -155,9 +200,24 @@ namespace Yilan.Voice.Runtime.Bootstrap
         private void OnDestroy()
         {
             IsValid = false;
-            if (_runtime?.Controller != null)
+            if (_observedController != null)
             {
-                _runtime.Controller.StateChanged -= OnControllerStateChanged;
+                _observedController.StateChanged -= OnControllerStateChanged;
+                _observedController.FaultReasonChanged -= OnControllerFaultReasonChanged;
+                _observedController.PlaybackFailureReported -= OnPlaybackFailureReported;
+                _observedController.TtsDegraded -= OnControllerTtsDegraded;
+                _observedController = null;
+            }
+            if (_playbackQueue != null)
+            {
+                _playbackQueue.FramePlayed -= OnTtsFramePlayed;
+                _playbackQueue.FrameDecodeFailed -= OnPlaybackDecodeFailed;
+                _playbackQueue.PlaybackFailed -= OnPlaybackFailed;
+            }
+            if (_ttsPlayer != null)
+            {
+                _ttsPlayer.PlaybackDrained -= OnTtsPlaybackDrained;
+                _ttsPlayer.PlaybackFailed -= OnTtsPlayerFailed;
             }
             if (panel != null)
             {
@@ -168,6 +228,7 @@ namespace Yilan.Voice.Runtime.Bootstrap
             }
             _runtime?.Dispose();
             _runtime = null;
+            _playbackQueue = null;
             _ttsPlayer?.Dispose();
             _ttsPlayer = null;
         }
@@ -192,7 +253,52 @@ namespace Yilan.Voice.Runtime.Bootstrap
         private void OnTtsFramePlayed(TtsPlayedItem item)
         {
             if (item == null) return;
-            _ttsPlayer?.Enqueue(item.Clip);
+            if (_ttsPlayer == null || _playbackQueue == null || _runtime?.Controller == null) return;
+            int generation = _playbackQueue.CurrentGeneration;
+            if (_ttsPlayer.Enqueue(item.Clip, item.PlaybackId, generation))
+                _runtime.Controller.ReportPlaybackClipEnqueued(item.PlaybackId, item.Sequence, generation);
+        }
+
+        private void OnTtsPlaybackDrained(string playbackId, int generation)
+        {
+            if (_playbackQueue == null || _playbackQueue.CurrentGeneration != generation) return;
+            _runtime?.Controller?.ReportAudioPlaybackDrained(playbackId, generation);
+        }
+
+        private void OnTtsPlayerFailed(string playbackId, int generation, string reason)
+        {
+            if (_playbackQueue == null || _playbackQueue.CurrentGeneration != generation) return;
+            _runtime?.Controller?.ReportPlaybackFailure(playbackId, reason, generation);
+        }
+
+        private void OnPlaybackDecodeFailed(string playbackId)
+        {
+            if (_playbackQueue == null) return;
+            int generation = _playbackQueue.CurrentGeneration;
+            _runtime?.Controller?.ReportPlaybackFailure(playbackId, "mp3_decode", generation);
+        }
+
+        private void OnPlaybackFailed(string playbackId, string reason)
+        {
+            if (_playbackQueue == null) return;
+            int generation = _playbackQueue.CurrentGeneration;
+            _runtime?.Controller?.ReportPlaybackFailure(playbackId, reason, generation);
+        }
+
+        private void OnPlaybackFailureReported(string reason, string playbackId)
+        {
+            _ttsPlayer?.Cancel(_playbackQueue != null ? _playbackQueue.CurrentGeneration : -1);
+            _pendingFailureHint = "语音播放失败（" + reason + "）";
+        }
+
+        private void OnControllerTtsDegraded()
+        {
+            _ttsPlayer?.Cancel(_playbackQueue != null ? _playbackQueue.CurrentGeneration : -1);
+        }
+
+        private void OnControllerFaultReasonChanged(string reason)
+        {
+            _pendingFailureHint = "语音连接失败（" + reason + "）";
         }
 
         private void OnRecordRequested()
@@ -210,15 +316,17 @@ namespace Yilan.Voice.Runtime.Bootstrap
             _ = _runtime?.CancelAsync();
         }
 
-        private void OnResetRequested()
+        private async void OnResetRequested()
         {
-            var controller = _runtime?.Controller;
-            if (controller != null && controller.State == VoiceClientState.Faulted)
-            {
-                // Faulted -> Idle; per-session state is cleared by Reset() so the next
-                // record click starts a fresh session id + turn counter.
-                controller.Reset();
-            }
+            var runtime = _runtime;
+            if (runtime?.Controller == null || runtime.Controller.State != VoiceClientState.Faulted) return;
+
+            // A Faulted controller cannot recover by Reset() alone: close and detach its
+            // socket first, then rebuild through the runtime's existing Native factory.
+            var result = await runtime.ResetFaultedAsync();
+            if (this == null || !ReferenceEquals(_runtime, runtime) || panel == null) return;
+            if (result == VoiceCommandResult.Ok)
+                panel.Bind(runtime.ViewModel);
         }
 
         private void OnControllerStateChanged(VoiceClientState state)
@@ -227,7 +335,7 @@ namespace Yilan.Voice.Runtime.Bootstrap
                 || state == VoiceClientState.Reconnecting
                 || state == VoiceClientState.Faulted)
             {
-                _ttsPlayer?.Cancel();
+                _ttsPlayer?.Cancel(_playbackQueue != null ? _playbackQueue.CurrentGeneration : -1);
             }
         }
 

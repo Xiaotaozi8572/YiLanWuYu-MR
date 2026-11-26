@@ -58,7 +58,11 @@ namespace Yilan.Voice.Runtime.UI
 
         private readonly VoiceSessionController _controller;
         private readonly SortedDictionary<int, string> _streamBlocks = new SortedDictionary<int, string>();
+        private readonly StringBuilder _reasoning = new StringBuilder();
         private int _streamAttempt;
+        private bool _reasoningExpanded;
+        private bool _reasoningManuallyChosen;
+        private bool _bodyStarted;
         private bool _answerFixed;
         private bool _disposed;
 
@@ -67,6 +71,13 @@ namespace Yilan.Voice.Runtime.UI
 
         /// <summary>Once-fixed answer text (gold carrier <c>answer.content</c>).</summary>
         public string AnswerText { get; private set; } = string.Empty;
+
+        /// <summary>Complete reasoning text received for the current generation attempt.</summary>
+        public string ReasoningText => _reasoning.ToString();
+
+        public bool HasReasoning => _reasoning.Length > 0;
+
+        public bool ReasoningExpanded => HasReasoning && _reasoningExpanded;
 
         /// <summary>True once the current turn's answer has been fixed; cleared on a new turn.</summary>
         public bool AnswerFixed => _answerFixed;
@@ -180,6 +191,9 @@ namespace Yilan.Voice.Runtime.UI
             _answerFixed = true;
             AnswerText = content ?? string.Empty;
             _streamBlocks.Clear();
+            _bodyStarted = !string.IsNullOrWhiteSpace(AnswerText);
+            if (_bodyStarted && !_reasoningManuallyChosen)
+                _reasoningExpanded = false;
             HintText = string.Empty;
             State = VoiceUiState.AnswerDisplayed;
             RaiseChanged();
@@ -192,12 +206,9 @@ namespace Yilan.Voice.Runtime.UI
 
             if (message.event_type == "generation.started")
             {
-                if (payload.attempt >= _streamAttempt)
-                {
-                    _streamAttempt = payload.attempt;
-                    _streamBlocks.Clear();
-                    AnswerText = string.Empty;
-                }
+                if (payload.attempt < _streamAttempt) return;
+                if (payload.attempt > _streamAttempt)
+                    AdvanceAttempt(payload.attempt);
                 HintText = payload.origin == "recovery" ? "主回答不可用，正在生成备用回答…" : "正在生成回答…";
             }
             else if (message.event_type == "progress.updated")
@@ -206,22 +217,34 @@ namespace Yilan.Voice.Runtime.UI
             }
             else if (message.event_type == "reasoning.delta")
             {
-                // The protocol may carry model-visible reasoning. Do not place raw reasoning in
-                // the public answer box; only expose a stable progress hint.
+                if (!AcceptAttempt(payload.attempt)) return;
+                string delta = payload.text ?? string.Empty;
+                if (delta.Length > 0)
+                {
+                    bool wasEmpty = _reasoning.Length == 0;
+                    _reasoning.Append(delta);
+                    if (wasEmpty && !_bodyStarted && !_reasoningManuallyChosen)
+                        _reasoningExpanded = true;
+                }
                 HintText = "正在分析问题…";
             }
             else if (message.event_type == "answer.block")
             {
-                if (payload.attempt < _streamAttempt) return;
-                _streamAttempt = Math.Max(_streamAttempt, payload.attempt);
+                if (!AcceptAttempt(payload.attempt)) return;
                 _streamBlocks[payload.block_id] = payload.text ?? string.Empty;
                 AnswerText = JoinStreamBlocks();
+                if (!string.IsNullOrWhiteSpace(payload.text))
+                {
+                    _bodyStarted = true;
+                    if (!_reasoningManuallyChosen)
+                        _reasoningExpanded = false;
+                }
                 State = VoiceUiState.AwaitingAnswer;
                 HintText = "回答生成中…";
             }
             else if (message.event_type == "answer.block.invalidated")
             {
-                if (payload.attempt < _streamAttempt) return;
+                if (!AcceptAttempt(payload.attempt)) return;
                 _streamBlocks.Remove(payload.block_id);
                 AnswerText = JoinStreamBlocks();
                 HintText = "正在更新回答…";
@@ -239,6 +262,32 @@ namespace Yilan.Voice.Runtime.UI
                 HintText = "本次问答已取消";
             }
 
+            RaiseChanged();
+        }
+
+        private bool AcceptAttempt(int attempt)
+        {
+            if (attempt < _streamAttempt) return false;
+            if (attempt > _streamAttempt) AdvanceAttempt(attempt);
+            return true;
+        }
+
+        private void AdvanceAttempt(int attempt)
+        {
+            _streamAttempt = attempt;
+            _streamBlocks.Clear();
+            _reasoning.Clear();
+            AnswerText = string.Empty;
+            _bodyStarted = false;
+            if (!_reasoningManuallyChosen)
+                _reasoningExpanded = false;
+        }
+
+        public void SetReasoningExpanded(bool expanded)
+        {
+            if (!HasReasoning) return;
+            _reasoningManuallyChosen = true;
+            _reasoningExpanded = expanded;
             RaiseChanged();
         }
 
@@ -334,7 +383,11 @@ namespace Yilan.Voice.Runtime.UI
             TranscriptIsFinal = false;
             HintText = string.Empty;
             _streamBlocks.Clear();
+            _reasoning.Clear();
             _streamAttempt = 0;
+            _reasoningExpanded = false;
+            _reasoningManuallyChosen = false;
+            _bodyStarted = false;
         }
 
         private void RaiseChanged() => Changed?.Invoke();

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 using NUnit.Framework;
@@ -18,6 +19,45 @@ namespace Yilan.Voice.Transport
     public class NativeVoiceSocketTests
     {
         private static Uri DummyUri => new Uri("ws://voice.test/session?token=secret");
+
+        private static object CreateNativeGeneration(NativeVoiceSocket socket)
+        {
+            var create = typeof(NativeVoiceSocket).GetMethod(
+                "CreateAndSubscribeLocked", BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.NotNull(create, "the production bottom-layer subscription path must exist");
+            create.Invoke(socket, new object[] { DummyUri });
+            var field = typeof(NativeVoiceSocket).GetField(
+                "_connection", BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.NotNull(field);
+            var generation = field.GetValue(socket);
+            var nativeSocket = generation.GetType().GetField(
+                "Socket", BindingFlags.Instance | BindingFlags.Public);
+            Assert.NotNull(nativeSocket);
+            return nativeSocket.GetValue(generation);
+        }
+
+        private static object CurrentNativeGeneration(NativeVoiceSocket socket)
+        {
+            var field = typeof(NativeVoiceSocket).GetField(
+                "_connection", BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.NotNull(field);
+            return field.GetValue(socket);
+        }
+
+        private static Delegate NativeEvent(object nativeSocket, string eventName)
+        {
+            var field = nativeSocket.GetType().GetField(
+                eventName, BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.NotNull(field, "NativeWebSocket event backing field " + eventName);
+            return field.GetValue(nativeSocket) as Delegate;
+        }
+
+        private static void RaiseNativeEvent(object nativeSocket, string eventName, params object[] args)
+        {
+            var handler = NativeEvent(nativeSocket, eventName);
+            Assert.NotNull(handler, "NativeWebSocket callback must be subscribed");
+            handler.DynamicInvoke(args);
+        }
 
         // ---------------- Connect ----------------
 
@@ -275,6 +315,118 @@ namespace Yilan.Voice.Transport
         }
 
         // ---------------- Callback release after dispose ----------------
+
+        [Test]
+        public void NativeWrapper_CloseAndLateCallbacks_AreIsolatedPerUnderlyingGeneration()
+        {
+            var sock = new NativeVoiceSocket(DummyUri);
+            Assert.IsInstanceOf<NativeVoiceSocket>(sock,
+                "A30 must exercise the real adapter, not FakeVoiceSocket");
+            var opened = 0;
+            var payloads = 0;
+            var errors = 0;
+            var closes = new List<VoiceCloseInfo>();
+            sock.Opened += () => opened++;
+            sock.Payload += _ => payloads++;
+            sock.Error += _ => errors++;
+            sock.Closed += closes.Add;
+
+            object first = CreateNativeGeneration(sock);
+            Delegate firstOpen = NativeEvent(first, "OnOpen");
+            Delegate firstMessage = NativeEvent(first, "OnMessage");
+            Delegate firstError = NativeEvent(first, "OnError");
+            Delegate firstClose = NativeEvent(first, "OnClose");
+            var firstGeneration = CurrentNativeGeneration(sock);
+            var firstOpened = (TaskCompletionSource<bool>)firstGeneration.GetType()
+                .GetField("Opened", BindingFlags.Instance | BindingFlags.Public).GetValue(firstGeneration);
+            var firstClosed = (TaskCompletionSource<bool>)firstGeneration.GetType()
+                .GetField("Closed", BindingFlags.Instance | BindingFlags.Public).GetValue(firstGeneration);
+            Assert.NotNull(firstOpen);
+            Assert.NotNull(firstMessage);
+            Assert.NotNull(firstError);
+            Assert.NotNull(firstClose);
+
+            firstOpen.DynamicInvoke();
+            Assert.IsTrue(firstOpened.Task.GetAwaiter().GetResult());
+            Assert.AreEqual(1, opened);
+            var closeEnum = firstClose.Method.GetParameters()[0].ParameterType;
+            firstClose.DynamicInvoke(Enum.ToObject(closeEnum, 1000));
+            Assert.AreEqual(1, closes.Count);
+            Assert.IsTrue(firstClosed.Task.IsCompleted);
+
+            object second = CreateNativeGeneration(sock);
+            Delegate secondClose = NativeEvent(second, "OnClose");
+            Delegate secondOpen = NativeEvent(second, "OnOpen");
+            var secondGeneration = CurrentNativeGeneration(sock);
+            var secondOpened = (TaskCompletionSource<bool>)secondGeneration.GetType()
+                .GetField("Opened", BindingFlags.Instance | BindingFlags.Public).GetValue(secondGeneration);
+            var secondClosed = (TaskCompletionSource<bool>)secondGeneration.GetType()
+                .GetField("Closed", BindingFlags.Instance | BindingFlags.Public).GetValue(secondGeneration);
+            Assert.NotNull(secondClose);
+
+            // A late old-generation callback cannot consume or mutate the new generation.
+            firstOpen.DynamicInvoke();
+            firstMessage.DynamicInvoke(new object[] { new byte[] { 1, 2, 3 } });
+            firstError.DynamicInvoke("late old error");
+            Assert.AreEqual(1, opened);
+            Assert.AreEqual(0, payloads);
+            Assert.AreEqual(0, errors);
+
+            secondOpen.DynamicInvoke();
+            Assert.IsTrue(secondOpened.Task.GetAwaiter().GetResult());
+            secondClose.DynamicInvoke(Enum.ToObject(closeEnum, 1000));
+            secondClose.DynamicInvoke(Enum.ToObject(closeEnum, 1000));
+            firstClose.DynamicInvoke(Enum.ToObject(closeEnum, 1000));
+            Assert.IsTrue(secondClosed.Task.IsCompleted);
+            Assert.AreEqual(2, opened);
+            Assert.AreEqual(2, closes.Count,
+                "each bottom-layer generation closes once; duplicate and stale callbacks are ignored");
+            Assert.AreEqual(1000, closes[1].Code);
+
+            sock.Dispose();
+        }
+
+        [Test]
+        public void NativeWrapper_DisposeCompletesOnlyOwnedWaits_AndCannotReconnect()
+        {
+            var sock = new NativeVoiceSocket(DummyUri);
+            var opened = 0;
+            var payloads = 0;
+            var errors = 0;
+            var closes = 0;
+            sock.Opened += () => opened++;
+            sock.Payload += _ => payloads++;
+            sock.Error += _ => errors++;
+            sock.Closed += _ => closes++;
+
+            object native = CreateNativeGeneration(sock);
+            Delegate open = NativeEvent(native, "OnOpen");
+            Delegate message = NativeEvent(native, "OnMessage");
+            Delegate error = NativeEvent(native, "OnError");
+            Delegate close = NativeEvent(native, "OnClose");
+            var generation = CurrentNativeGeneration(sock);
+            var openedWait = (TaskCompletionSource<bool>)generation.GetType()
+                .GetField("Opened", BindingFlags.Instance | BindingFlags.Public).GetValue(generation);
+            var closedWait = (TaskCompletionSource<bool>)generation.GetType()
+                .GetField("Closed", BindingFlags.Instance | BindingFlags.Public).GetValue(generation);
+
+            sock.Dispose();
+
+            Assert.IsTrue(openedWait.Task.IsCompleted,
+                "dispose completes the open waiter owned by this generation");
+            Assert.IsTrue(closedWait.Task.IsCompleted,
+                "dispose completes the close waiter owned by this generation");
+            Assert.Throws<ObjectDisposedException>(
+                () => sock.ConnectAsync(DummyUri).GetAwaiter().GetResult());
+
+            open.DynamicInvoke();
+            message.DynamicInvoke(new object[] { new byte[] { 9 } });
+            error.DynamicInvoke("late dispose error");
+            var closeEnum = close.Method.GetParameters()[0].ParameterType;
+            close.DynamicInvoke(Enum.ToObject(closeEnum, 1000));
+            Assert.AreEqual(0, opened + payloads + errors + closes,
+                "callbacks arriving after dispose cannot reach subscribers");
+        }
 
         [Test]
         public void Dispose_ReleasesCallbacks_NoEventsAfterDispose()

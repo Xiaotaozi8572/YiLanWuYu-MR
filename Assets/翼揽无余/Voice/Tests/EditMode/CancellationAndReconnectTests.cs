@@ -78,6 +78,18 @@ namespace Yilan.Voice.Cancellation
             return JsonUtility.ToJson(m);
         }
 
+        private static string PlaybackCompletedJson(string sessionId, string turnId)
+        {
+            return JsonUtility.ToJson(new VoiceStateMessage
+            {
+                type = "voice.state",
+                session_id = sessionId,
+                turn_id = turnId,
+                state = "speaking",
+                status = "playback.completed"
+            });
+        }
+
         private static string HeaderJson(string sessionId, string turnId, string playbackId, int seq, bool isFinal)
         {
             var m = new TtsFrameMessage
@@ -214,15 +226,52 @@ namespace Yilan.Voice.Cancellation
         }
 
         [Test]
-        public void Cancel_FromCapturingAwaitingAndPlaying_EachSendsSessionCancel()
+        public void Cancel_SerializesFeedbackRecognizedAsStop()
+        {
+            var (c, s, _fb) = ToPlaying();
+
+            Assert.AreEqual(VoiceCommandResult.Ok, c.CancelAsync());
+            var message = JsonUtility.FromJson<SessionCancelMessage>(LastText(s));
+
+            Assert.AreEqual("session.cancel", message.type);
+            Assert.AreEqual(c.SessionId, message.session_id);
+            Assert.AreEqual(c.TurnId, message.turn_id);
+            Assert.AreEqual("停一下", message.feedback);
+            s.Dispose();
+        }
+
+        [Test]
+        public void Cancel_AfterBackendSendCompleted_StopsLocallyAndFinalizesTurn()
+        {
+            var (c, s, fb) = ToPlaying();
+            const string playbackId = "playback_server1";
+            s.SimulatePayload(Encoding.UTF8.GetBytes(HeaderJson(
+                c.SessionId, c.TurnId, playbackId, 0, true)));
+            s.SimulatePayload(new byte[] { 0x49, 0x44, 0x33, 1, 2, 3 });
+            s.DispatchMessageQueue();
+            s.SimulatePayload(Encoding.UTF8.GetBytes(PlaybackCompletedJson(c.SessionId, c.TurnId)));
+            s.DispatchMessageQueue();
+            int sentBeforeCancel = s.SentTexts.Count;
+            Assert.AreEqual(VoiceCommandResult.Ok, c.CancelAsync());
+
+            Assert.AreEqual(VoiceClientState.Ready, c.State);
+            Assert.AreEqual(1, fb.CancelCalls);
+            Assert.AreEqual(sentBeforeCancel, s.SentTexts.Count,
+                "a completed backend turn must not receive a late session.cancel");
+            s.Dispose();
+        }
+
+        [Test]
+        public void Cancel_FromPreAnswerStagesSettlesLocally_AndPlayingSendsSessionCancel()
         {
             // Capturing
             {
                 var (c, s) = ToReady(new FakePlayback());
                 c.RecordStartAsync();
                 Assert.AreEqual(VoiceCommandResult.Ok, c.CancelAsync());
-                Assert.AreEqual(VoiceClientState.Cancelling, c.State);
-                Assert.That(LastText(s), Does.Contain("\"session.cancel\""));
+                Assert.AreEqual(VoiceClientState.Ready, c.State, "pre-answer cancel settles locally");
+                Assert.That(string.Join("\n", s.SentTexts), Does.Not.Contain("\"session.cancel\""),
+                    "the server is not SPEAKING yet, so session.cancel would be rejected");
                 s.Dispose();
             }
             // AwaitingAnswer
@@ -232,8 +281,9 @@ namespace Yilan.Voice.Cancellation
                 c.RecordEndAsync();
                 Assert.AreEqual(VoiceClientState.AwaitingAnswer, c.State);
                 Assert.AreEqual(VoiceCommandResult.Ok, c.CancelAsync());
-                Assert.AreEqual(VoiceClientState.Cancelling, c.State);
-                Assert.That(LastText(s), Does.Contain("\"session.cancel\""));
+                Assert.AreEqual(VoiceClientState.Ready, c.State, "pre-answer cancel settles locally");
+                Assert.That(string.Join("\n", s.SentTexts), Does.Not.Contain("\"session.cancel\""),
+                    "the server is not SPEAKING yet, so session.cancel would be rejected");
                 s.Dispose();
             }
             // Playing

@@ -56,7 +56,8 @@ namespace Yilan.Voice.Runtime.Playback
         /// temp file removed, but the already-displayed answer text is preserved (text downgrade).</summary>
         event Action<string> FrameDecodeFailed;
 
-        /// <summary>Fired once per round after the ordered drain completes (round back to Ready).</summary>
+        /// <summary>Fired once after the ordered decode queue drains successfully; this does not
+        /// mean the Unity AudioSource has finished sounding the decoded clips.</summary>
         event Action<string> PlaybackCompleted;
 
         /// <summary>Feed one paired tts.frame header + its MP3 binary body. Returns a stable code; never throws.</summary>

@@ -65,6 +65,28 @@ namespace Yilan.Voice.Runtime.Session
         private bool _turnActive;
         private bool _answered;
         private bool _playbackCompleted;
+        private int _finalTtsSequence = -1;
+        private bool _finalPayloadReceived;
+        private bool _backendSendCompleted;
+        private bool _decoderDrainCompleted;
+        private bool _finalClipEnqueued;
+        private bool _audioPlayerDrained;
+        private int _playbackGeneration = -1;
+        private DateTime _playbackDeadlineUtc = DateTime.MinValue;
+        private string _playbackFailureTurnId;
+        private int _connectionGeneration;
+        private bool _sessionTimeoutPending;
+        private bool _settledTimeoutAwaitingNewOpen;
+        private int _sessionTimeoutGeneration = -1;
+        private string _pendingStartSessionId;
+        private string _pendingStartTurnId;
+        private int _pendingStartGeneration = -1;
+        private bool _ttsErrorPending;
+        private string _ttsErrorTurnId;
+        private int _ttsErrorGeneration = -1;
+        private int _lastTtsDegradationGeneration = -1;
+        private string _pendingClarificationReason;
+        private string _pendingClarificationTurnId;
         private bool _answerStreamAccepted;
         private string _answerStreamRequestId;
         private int _answerStreamSequence = -1;
@@ -74,6 +96,7 @@ namespace Yilan.Voice.Runtime.Session
         /// <summary>Injectable health preflight; null skips the probe. Production wires
         /// this to <see cref="VoiceHealthClient"/>; tests substitute a stub.</summary>
         internal Func<VoiceClientConfig, Task<bool>> HealthProbe;
+        internal Func<DateTime> UtcNow = () => DateTime.UtcNow;
 
         /// <summary>Fired after any committed state change.</summary>
         public event Action<VoiceClientState> StateChanged;
@@ -103,6 +126,10 @@ namespace Yilan.Voice.Runtime.Session
 
         /// <summary>Fired when an inbound message is rejected (stale/other/late/sequence).</summary>
         public event Action<VoiceCommandResult> MessageRejected;
+        /// <summary>Fired when Faulted is entered with a stable, non-sensitive reason.</summary>
+        public event Action<string> FaultReasonChanged;
+        /// <summary>Fired for local TTS failures without changing protocol/session state.</summary>
+        public event Action<string, string> PlaybackFailureReported;
 
         public VoiceClientState State => _state;
         public string SessionId => _sessionId;
@@ -112,6 +139,12 @@ namespace Yilan.Voice.Runtime.Session
         public bool AnswerStreamAccepted => _answerStreamAccepted;
         /// <summary>Last rejection classification (for diagnostics/tests).</summary>
         public VoiceCommandResult LastRejection { get; private set; } = VoiceCommandResult.Ok;
+        public string LastFaultReason { get; private set; } = string.Empty;
+        public string LastFaultCode { get; private set; } = string.Empty;
+        public string LastFaultField { get; private set; } = string.Empty;
+        public int? LastCloseCode { get; private set; }
+        public string LastFailedPlaybackId { get; private set; } = string.Empty;
+        public string LastPlaybackFailureReason { get; private set; } = string.Empty;
 
         /// <summary>Optional TTS playback queue this controller drives for barge-in ordering and TTS
         /// MP3 body delivery. Ownership stays with the caller (never disposed here).</summary>
@@ -141,6 +174,8 @@ namespace Yilan.Voice.Runtime.Session
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _ttsPairer = new TtsBinaryPairer(null); // id checks live in the parser against _binding
             _playback = playback;
+            if (_playback != null)
+                _playback.PlaybackCompleted += OnDecoderPlaybackCompleted;
             if (socket != null)
                 Bind(socket);
         }
@@ -218,9 +253,12 @@ namespace Yilan.Voice.Runtime.Session
             if (_state == VoiceClientState.Capturing) return VoiceCommandResult.Idempotent;
             if (_state != VoiceClientState.Ready) return VoiceCommandResult.InvalidState;
 
+            ResetPlaybackCompletionFacts();
+
             if (!_turnActive || !_sessionStartSent)
             {
                 ResetAnswerStreamTurnState();
+                _answerStreamAccepted = false;
                 _turnCounter++;
                 _turnId = "turn-" + _turnCounter.ToString("D4");
                 _audioStreamId = "stream-audio-" + _turnCounter;
@@ -240,8 +278,8 @@ namespace Yilan.Voice.Runtime.Session
                     AudioStreamId = null,
                     PlaybackId = null
                 };
-                SendSessionStart();
                 _turnActive = true;
+                SendSessionStart();
             }
             _answered = false;
             _playbackCompleted = false;
@@ -360,6 +398,18 @@ namespace Yilan.Voice.Runtime.Session
 
             bool wasPlaying = _state == VoiceClientState.Playing;
 
+            // The backend has already finished sending this turn. Stop any remaining
+            // local AudioSource playback and use the shared turn finalizer; sending a
+            // late session.cancel would target a backend turn that is already IDLE.
+            if (wasPlaying && _backendSendCompleted)
+            {
+                _playback?.Cancel();
+                _ttsPairer = new TtsBinaryPairer(null);
+                FinalizeTurn(_sessionId, _turnId, _connectionGeneration,
+                    discardPendingTts: true);
+                return VoiceCommandResult.Ok;
+            }
+
             var code = Transition(VoiceClientState.Cancelling);
             if (code == VoiceStateTransitionCode.Illegal || code == VoiceStateTransitionCode.SameState)
                 return VoiceCommandResult.InvalidState;
@@ -383,7 +433,7 @@ namespace Yilan.Voice.Runtime.Session
                 session_id = _sessionId,
                 turn_id = _turnId,
                 audio_stream_id = _audioStreamId,
-                feedback = "barge-in"
+                feedback = "停一下"
             };
             TrySendText(JsonUtility.ToJson(c));
             StartCancelWatchdog();
@@ -404,6 +454,7 @@ namespace Yilan.Voice.Runtime.Session
             if (_state != VoiceClientState.Cancelling) return;
             _answered = false;
             _playbackCompleted = false;
+            ResetPlaybackCompletionFacts();
             _expectedTtsSeq = -1;
             _playbackId = null;
             _binding = _sessionId == null ? null : new VoiceBinding
@@ -460,6 +511,9 @@ namespace Yilan.Voice.Runtime.Session
 
             _sessionStartSent = false;
             _turnActive = false;
+            ClearPendingStart();
+            ClearPendingTtsError();
+            ClearPendingClarification();
             try
             {
                 await _socket.ConnectAsync(_config.BuildWsUri(), _config.ConnectTimeoutMs).ConfigureAwait(false);
@@ -489,8 +543,94 @@ namespace Yilan.Voice.Runtime.Session
             _turnActive = false;
             _answered = false;
             _playbackCompleted = false;
+            ResetPlaybackCompletionFacts();
             _ttsPairer = new TtsBinaryPairer(null);
+            ClearPendingStart();
+            ClearPendingTtsError();
+            ClearPendingClarification();
+            _lastTtsDegradationGeneration = -1;
+            _playbackFailureTurnId = null;
+            LastFaultReason = LastFaultCode = LastFaultField = string.Empty;
+            LastCloseCode = null;
+            LastFailedPlaybackId = LastPlaybackFailureReason = string.Empty;
             return VoiceCommandResult.Ok;
+        }
+
+        /// <summary>Record a local playback failure using a fixed internal reason vocabulary.</summary>
+        public void ReportPlaybackFailure(string playbackId, string reason)
+        {
+            ReportPlaybackFailure(playbackId, reason, _playbackGeneration);
+        }
+
+        /// <summary>Report a current-round local failure, carrying the queue generation that produced it.</summary>
+        public void ReportPlaybackFailure(string playbackId, string reason, int generation)
+        {
+            if (!_turnActive || !_answered || _state != VoiceClientState.Playing ||
+                playbackId != _playbackId ||
+                (_playbackGeneration >= 0 && generation >= 0 && generation != _playbackGeneration) ||
+                _playbackFailureTurnId == _turnId)
+                return;
+
+            string failedTurn = _turnId;
+            int failedConnectionGeneration = _connectionGeneration;
+            _playbackFailureTurnId = failedTurn;
+            LastFailedPlaybackId = SafeToken(playbackId);
+            LastPlaybackFailureReason = reason == "mp3_decode" ? "mp3_decode" : "local_playback";
+            _playback?.Cancel();
+            PlaybackFailureReported?.Invoke(LastPlaybackFailureReason, LastFailedPlaybackId);
+            FinalizeTurn(_sessionId, failedTurn, failedConnectionGeneration,
+                discardPendingTts: true, displayOnlyDegraded: true);
+        }
+
+        /// <summary>Bound all local audio wait stages by the configured technical completion deadline.</summary>
+        public void TickPlaybackDeadline()
+        {
+            if (_playbackDeadlineUtc == DateTime.MinValue || !_turnActive || !_answered ||
+                _state != VoiceClientState.Playing)
+                return;
+            DateTime now = UtcNow != null ? UtcNow() : DateTime.UtcNow;
+            if (now < _playbackDeadlineUtc) return;
+            ReportPlaybackFailure(_playbackId, "playback_timeout", _playbackGeneration);
+        }
+
+        /// <summary>Record that the final decoded clip was accepted by the Unity AudioSource player.</summary>
+        public void ReportPlaybackClipEnqueued(string playbackId, int sequence, int generation)
+        {
+            if (!_turnActive || !_answered || _state != VoiceClientState.Playing ||
+                !_finalPayloadReceived || generation < 0 ||
+                playbackId != _playbackId)
+                return;
+            if (_playbackGeneration >= 0 && _playbackGeneration != generation) return;
+            _playbackGeneration = generation;
+            if (sequence == _finalTtsSequence)
+                _finalClipEnqueued = true;
+        }
+
+        /// <summary>Record actual AudioSource drain for the matching playback generation.</summary>
+        public void ReportAudioPlaybackDrained(string playbackId, int generation)
+        {
+            if (!_turnActive || !_answered || _state != VoiceClientState.Playing ||
+                playbackId != _playbackId || generation < 0 || generation != _playbackGeneration)
+                return;
+            _audioPlayerDrained = true;
+            TryCompletePlaybackTurn();
+        }
+
+        private void OnDecoderPlaybackCompleted(string playbackId)
+        {
+            if (!_turnActive || !_answered || _state != VoiceClientState.Playing ||
+                !_finalPayloadReceived || _finalTtsSequence < 0 || playbackId != _playbackId)
+                return;
+            _decoderDrainCompleted = true;
+            TryCompletePlaybackTurn();
+        }
+
+        private void TryCompletePlaybackTurn()
+        {
+            if (!_answered || !_finalPayloadReceived || !_decoderDrainCompleted ||
+                !_finalClipEnqueued || !_audioPlayerDrained || _playbackGeneration < 0)
+                return;
+            FinalizeTurn(_sessionId, _turnId, _connectionGeneration, discardPendingTts: true);
         }
 
         // =============================== Lifecycle: pause / resume ===============================
@@ -519,6 +659,9 @@ namespace Yilan.Voice.Runtime.Session
             _turnActive = false;
             _answered = false;
             _playbackCompleted = false;
+            ClearPendingStart();
+            ClearPendingTtsError();
+            ClearPendingClarification();
             return VoiceCommandResult.Ok;
         }
 
@@ -562,6 +705,9 @@ namespace Yilan.Voice.Runtime.Session
             _expectedAudioSeq = -1;
             _expectedTtsSeq = -1;
             _ttsPairer = new TtsBinaryPairer(null);
+            ClearPendingStart();
+            ClearPendingTtsError();
+            ClearPendingClarification();
 
             _autoReconnectTask = AutoReconnectAsync();
         }
@@ -618,7 +764,7 @@ namespace Yilan.Voice.Runtime.Session
                     Transition(VoiceClientState.Reconnecting);
             }
             // Budget exhausted without a successful re-open.
-            TransitionFault();
+            TransitionFault("reconnect_exhausted");
         }
 
         // =============================== Events ===============================
@@ -629,6 +775,10 @@ namespace Yilan.Voice.Runtime.Session
             // While connecting (initial or after reconnect), establish the session binding.
             if ((_state == VoiceClientState.Connecting || _state == VoiceClientState.Reconnecting) && !_sessionStartSent)
             {
+                _connectionGeneration++;
+                _sessionTimeoutPending = false;
+                _sessionTimeoutGeneration = -1;
+                _settledTimeoutAwaitingNewOpen = false;
                 ResetAnswerStreamState();
                 _turnCounter++;
                 _turnId = "turn-" + _turnCounter.ToString("D4");
@@ -642,14 +792,18 @@ namespace Yilan.Voice.Runtime.Session
                 // exactly like the initial connect and StartAutoReconnect's reset.
                 _binding = null;
                 _playbackId = null;
-                SendSessionStart();
                 _turnActive = true;
+                SendSessionStart();
             }
         }
 
         private void OnError(VoiceSocketError error)
         {
             if (_disposed) return;
+            _connectionGeneration++;
+            ClearPendingStart();
+            ClearPendingTtsError();
+            ClearPendingClarification();
             // A recoverable transport error kind (Connect / Timeout) triggers the same bounded
             // automatic reconnect as a recoverable close; every other error is terminal.
             if (VoiceStateRules.IsActive(_state) &&
@@ -658,14 +812,27 @@ namespace Yilan.Voice.Runtime.Session
                 StartAutoReconnect();
                 return;
             }
-            TransitionFault();
+            TransitionFault(error == null ? "socket_unexpected" : "socket_" + error.Kind.ToString().ToLowerInvariant());
         }
 
         private void OnClosed(VoiceCloseInfo info)
         {
             if (_disposed) return;
+            int closedGeneration = _connectionGeneration;
+            bool timeoutForClosedGeneration = _sessionTimeoutPending &&
+                _sessionTimeoutGeneration == closedGeneration;
+            _connectionGeneration++;
+            ClearPendingStart();
+            ClearPendingTtsError();
+            ClearPendingClarification();
+            LastCloseCode = info.Code;
             if (info.Category == VoiceCloseCategory.Normal)
             {
+                if (timeoutForClosedGeneration)
+                {
+                    FinalizeSessionTimeout(closedGeneration, alreadyAdvanced: true);
+                    return;
+                }
                 // Clean server close -> settle to Idle if we were mid-session.
                 // The state table has no active -> Idle edge, so route through the
                 // two legal edges: active -> Cancelling -> Idle.
@@ -681,12 +848,11 @@ namespace Yilan.Voice.Runtime.Session
             // not a protocol violation — a fresh ConnectAsync opens a new session cleanly, so
             // settle to Idle (the same legal two-hop the Normal close uses) with a UI hint
             // instead of faulting. Other Application codes (4400/4401) stay terminal below.
-            if (VoiceStateRules.IsActive(_state) && info.Code == 4408)
+            if (info.Code == 4408)
             {
-                _playback?.Cancel(); // silent local stop; no TTS will arrive on a dead socket
-                Transition(VoiceClientState.Cancelling);
-                Transition(VoiceClientState.Idle);
-                SessionExpired?.Invoke();
+                if (_settledTimeoutAwaitingNewOpen) return;
+                if (timeoutForClosedGeneration || VoiceStateRules.IsActive(_state))
+                    FinalizeSessionTimeout(closedGeneration, alreadyAdvanced: true);
                 return;
             }
             // A recoverable transport drop triggers a BOUNDED automatic reconnect (backoff 1/2/4 s,
@@ -700,7 +866,7 @@ namespace Yilan.Voice.Runtime.Session
             }
             // Any other abnormal close across an established session is a transport fault.
             if (VoiceStateRules.IsActive(_state))
-                TransitionFault();
+                TransitionFault("websocket_close", closeCode: info.Code);
         }
 
         private void OnPayload(byte[] payload)
@@ -708,7 +874,7 @@ namespace Yilan.Voice.Runtime.Session
             if (_disposed) return;
             string json;
             try { json = Encoding.UTF8.GetString(payload); }
-            catch { TransitionFault(); return; }
+            catch { TransitionFault("protocol_invalid_utf8"); return; }
 
             var parse = VoiceProtocolParser.Parse(json, _binding);
             if (parse.IsOk)
@@ -722,14 +888,16 @@ namespace Yilan.Voice.Runtime.Session
             // the accept point) and deliver header + body to the playback queue. Both halves are
             // validated/gated by the parser and state machine, so id checks are not duplicated here.
             // Deciding by the pairer's pending state (not by Playing/playbackCompleted) also covers
-            // the FINAL frame: its body arrives after HandleTts(is_final) has already transitioned
-            // the controller to Ready, but the accepted final header is still pending in the pairer.
-            if (_playback != null && _ttsPairer.HasPending)
+            // the FINAL frame: its body arrives after HandleTts(is_final) records the final sequence,
+            // while the controller remains Playing and the accepted header stays pending.
+            if (_ttsPairer.HasPending)
             {
                 var pair = _ttsPairer.OnBinary(payload);
                 if (pair.Code == TtsPairCode.HeaderConsumed && pair.Header != null)
                 {
-                    _playback.EnqueueTts(pair.Header, payload);
+                    if (pair.Header.is_final && pair.Header.sequence == _finalTtsSequence)
+                        _finalPayloadReceived = true;
+                    _playback?.EnqueueTts(pair.Header, payload);
                     return;
                 }
             }
@@ -739,7 +907,16 @@ namespace Yilan.Voice.Runtime.Session
                 case VoiceParseCode.VersionMismatch:
                     // A started status without voice-ws-v1 -> protocol fault.
                     Reject(VoiceCommandResult.OtherSession);
-                    TransitionFault();
+                    TransitionFault("protocol_version_mismatch", field: "protocol_version");
+                    return;
+                case VoiceParseCode.InvalidJson:
+                    TransitionFault("protocol_invalid_json");
+                    return;
+                case VoiceParseCode.UnknownType:
+                    TransitionFault("protocol_unknown_type", field: SafeProtocolField(parse.Reason, "type"));
+                    return;
+                case VoiceParseCode.MissingRequiredField:
+                    TransitionFault("protocol_missing_field", field: SafeProtocolField(parse.Reason, null));
                     return;
                 case VoiceParseCode.BindingMismatch:
                     HandleBindingMismatch(json);
@@ -821,25 +998,146 @@ namespace Yilan.Voice.Runtime.Session
         /// </summary>
         private void HandleVoiceError(VoiceErrorMessage m)
         {
-            bool ttsDegradation = m.code == "VOICE_TTS_ERROR" && _answered;
-            if (ttsDegradation)
+            if (m.code == "VOICE_SESSION_TIMEOUT")
             {
-                _playback?.Cancel(); // no TTS will arrive; silence any queued frames
-                _playbackCompleted = true;
-                if (_state == VoiceClientState.Playing) Transition(VoiceClientState.Ready);
-                TtsDegraded?.Invoke();
+                if (_sessionTimeoutPending || _settledTimeoutAwaitingNewOpen) return;
+                if (!VoiceStateRules.IsActive(_state))
+                {
+                    Reject(VoiceCommandResult.InvalidState);
+                    return;
+                }
+                BeginSessionTimeoutCleanup();
                 return;
             }
+            // voice.error intentionally has no session_id/turn_id. Do not infer ownership
+            // from answer display alone: defer TTS degradation until the server's following
+            // turn-bound voice.state(status=playback.failed) confirms the active binding.
+            bool ttsDegradation = m.code == "VOICE_TTS_ERROR" && _answered &&
+                                  _turnActive && !_playbackCompleted &&
+                                  _state == VoiceClientState.Playing && _connectionGeneration > 0;
+            if (ttsDegradation)
+            {
+                if (_ttsErrorPending) return;
+                _ttsErrorPending = true;
+                _ttsErrorTurnId = _turnId;
+                _ttsErrorGeneration = _connectionGeneration;
+                return;
+            }
+            if (m.code == "VOICE_TTS_ERROR" && !_answered &&
+                _lastTtsDegradationGeneration == _connectionGeneration)
+            {
+                Reject(VoiceCommandResult.LateAnswer);
+                return; // duplicate idless error from the just-finalized display-only turn
+            }
             Reject(VoiceCommandResult.InvalidState);
-            TransitionFault();
+            TransitionFault("server_error", code: m.code, field: m.field);
+        }
+
+        private void BeginSessionTimeoutCleanup()
+        {
+            if (_sessionTimeoutPending || !VoiceStateRules.IsActive(_state)) return;
+            _sessionTimeoutPending = true;
+            _sessionTimeoutGeneration = _connectionGeneration;
+            _playback?.Cancel();
+            _ttsPairer = new TtsBinaryPairer(null);
+            ClearPendingStart();
+            ClearPendingTtsError();
+            ClearPendingClarification();
+            if (_state != VoiceClientState.Cancelling)
+                Transition(VoiceClientState.Cancelling);
+            _ = CompleteSessionTimeoutCleanupAsync(_sessionTimeoutGeneration);
+        }
+
+        private async Task CompleteSessionTimeoutCleanupAsync(int generation)
+        {
+            // Let the server's close code arrive first so a 4400/4401 remains a real
+            // protocol/identity fault. If it never arrives, retire the local transport
+            // at the existing configured connection deadline and settle once.
+            await Task.Delay(Math.Max(1, _config.ConnectTimeoutMs));
+
+            if (_disposed || !_sessionTimeoutPending || _sessionTimeoutGeneration != generation ||
+                _connectionGeneration != generation)
+                return;
+            try
+            {
+                Task closeTask = _socket?.CloseAsync(1000, "session timeout", _config.ConnectTimeoutMs);
+                if (closeTask != null) _ = ObserveCloseTaskAsync(closeTask);
+            }
+            catch
+            {
+                // The configured settlement deadline is also the fallback for a close
+                // request that cannot be issued.
+            }
+            FinalizeSessionTimeout(generation, alreadyAdvanced: false);
+        }
+
+        private static async Task ObserveCloseTaskAsync(Task closeTask)
+        {
+            try { await closeTask; }
+            catch { }
+        }
+
+        private void FinalizeSessionTimeout(int generation, bool alreadyAdvanced)
+        {
+            if (_disposed || _settledTimeoutAwaitingNewOpen) return;
+            if (_sessionTimeoutPending && _sessionTimeoutGeneration != generation) return;
+            if (!alreadyAdvanced && _connectionGeneration != generation) return;
+            _sessionTimeoutPending = false;
+            _sessionTimeoutGeneration = -1;
+            _settledTimeoutAwaitingNewOpen = true;
+            _playback?.Cancel();
+            _ttsPairer = new TtsBinaryPairer(null);
+            if (_state != VoiceClientState.Cancelling && VoiceStateRules.IsActive(_state))
+                Transition(VoiceClientState.Cancelling);
+            if (_state == VoiceClientState.Cancelling)
+                Transition(VoiceClientState.Idle);
+            SessionExpired?.Invoke();
         }
 
         private void HandleVoiceState(VoiceStateMessage m)
         {
+            if (m.status == "playback.completed")
+            {
+                HandlePlaybackCompleted(m);
+                return;
+            }
+            if (m.status == "playback.failed")
+            {
+                HandlePlaybackFailed(m);
+                return;
+            }
+            if (m.status == "clarification")
+            {
+                HandleClarificationTerminal(m);
+                return;
+            }
             if (m.status != "session.started") return; // informational states: no mandatory transition
 
-            // Ready is ONLY entered from Connecting upon a real v1 started.
-            if (_state != VoiceClientState.Connecting)
+            // A start acknowledgement is accepted only for the exact start currently
+            // pending on this connection generation. This covers initial connect and
+            // each new turn while preserving Capturing/AwaitingAnswer when the ACK arrives.
+            if (_pendingStartSessionId == null || _pendingStartTurnId == null ||
+                _pendingStartGeneration != _connectionGeneration)
+            {
+                Reject(VoiceCommandResult.StaleTurn);
+                return;
+            }
+            if (m.session_id != _pendingStartSessionId)
+            {
+                Reject(VoiceCommandResult.OtherSession);
+                TransitionFault("session_started_mismatch", field: "session_id");
+                return;
+            }
+            if (m.turn_id != _pendingStartTurnId)
+            {
+                Reject(VoiceCommandResult.StaleTurn);
+                return;
+            }
+
+            bool initialConnection = _state == VoiceClientState.Connecting ||
+                                     _state == VoiceClientState.Reconnecting;
+            if (!initialConnection && _state != VoiceClientState.Ready &&
+                _state != VoiceClientState.Capturing && _state != VoiceClientState.AwaitingAnswer)
             {
                 Reject(VoiceCommandResult.StaleTurn);
                 return;
@@ -857,10 +1155,43 @@ namespace Yilan.Voice.Runtime.Session
                 AudioStreamId = null,
                 PlaybackId = null
             };
-            _turnActive = true;
-            _expectedAudioSeq = 0;
             _answerStreamAccepted = ContainsCapability(m.accepted_capabilities, "answer-stream-v1");
-            Transition(VoiceClientState.Ready);
+            ClearPendingStart();
+            if (initialConnection)
+            {
+                _turnActive = true;
+                _expectedAudioSeq = 0;
+                Transition(VoiceClientState.Ready);
+            }
+        }
+
+        private void HandlePlaybackCompleted(VoiceStateMessage message)
+        {
+            // voice.state carries session_id/turn_id but no playback_id in the established
+            // wire contract. Bind completion to the sole server-issued playback id learned
+            // for this active turn; this records server-send completion only and never closes
+            // the turn in place of local payload/decode/player completion.
+            if (!_turnActive || !_answered || _state != VoiceClientState.Playing ||
+                _finalTtsSequence < 0 || string.IsNullOrEmpty(_playbackId) ||
+                message.session_id != _sessionId || message.turn_id != _turnId)
+                return;
+            _backendSendCompleted = true;
+        }
+
+        private void HandlePlaybackFailed(VoiceStateMessage message)
+        {
+            if (!_ttsErrorPending || !_answered || !_turnActive ||
+                _state != VoiceClientState.Playing ||
+                _ttsErrorGeneration != _connectionGeneration ||
+                _ttsErrorTurnId != message.turn_id || _sessionId != message.session_id)
+                return; // duplicate or uncorrelated terminal status is idempotently ignored
+
+            string completedTurn = _ttsErrorTurnId;
+            int completedGeneration = _ttsErrorGeneration;
+            _playback?.Cancel();
+            if (!FinalizeTurn(message.session_id, completedTurn, completedGeneration,
+                    discardPendingTts: true, displayOnlyDegraded: true))
+                return;
         }
 
         private void HandleAnswerEvent(AnswerEventMessage m)
@@ -897,6 +1228,14 @@ namespace Yilan.Voice.Runtime.Session
 
             _answerStreamSequence = m.sequence;
             AnswerStreamReceived?.Invoke(m);
+            if (m.event_type == "request.failed" || m.event_type == "request.cancelled")
+            {
+                // These are the answer pipeline's ID-bound terminal events. They can arrive
+                // before answer.display and while VAD still has the record button held, so
+                // release either live input state without treating the candidate as success.
+                FinalizeTurn(m.session_id, m.turn_id, _connectionGeneration,
+                    discardPendingTts: true, allowInputTerminal: true);
+            }
         }
 
         private void HandleAnswer(AnswerDisplayMessage m)
@@ -922,6 +1261,7 @@ namespace Yilan.Voice.Runtime.Session
             // mismatch and the client deadlocks in Playing. The id is LEARNED from the first
             // tts.frame of this round in HandleTts.
             _playbackId = null;
+            StartPlaybackDeadline();
             _expectedTtsSeq = 0;
             _binding = new VoiceBinding
             {
@@ -936,7 +1276,11 @@ namespace Yilan.Voice.Runtime.Session
 
         private void HandleTts(TtsFrameMessage m)
         {
-            if (_playbackCompleted) { Reject(VoiceCommandResult.LateTts); return; }
+            if (_playbackCompleted || _finalTtsSequence >= 0)
+            {
+                Reject(VoiceCommandResult.LateTts);
+                return;
+            }
             if (!_answered || _state != VoiceClientState.Playing) { Reject(VoiceCommandResult.StaleTurn); return; }
 
             // Learn the server-issued playback id from the first tts.frame of this round:
@@ -959,53 +1303,64 @@ namespace Yilan.Voice.Runtime.Session
             if (m.sequence != _expectedTtsSeq)
             {
                 Reject(VoiceCommandResult.SequenceMismatch);
-                TransitionFault();
+                TransitionFault("tts_sequence_mismatch", field: "sequence");
                 return;
             }
             _expectedTtsSeq++;
             // Register the header for the immediately-following MP3 binary body, so OnPayload can
-            // pair them and hand (header, body) to the playback queue. Deliberately kept across
-            // is_final (the body for the final frame arrives right after the header).
-            _ttsPairer.OnTextHeader(m);
+            // pair them and hand (header, body) to the playback queue. is_final records only the
+            // final sequence; it must not clear turn/playback ownership or mark the round Ready.
+            TtsPairResult pairResult = _ttsPairer.OnTextHeader(m);
+            if (pairResult.Code != TtsPairCode.HeaderAccepted)
+            {
+                Reject(VoiceCommandResult.SequenceMismatch);
+                TransitionFault("tts_pairing_" + pairResult.Code.ToString().ToLowerInvariant());
+                return;
+            }
             TtsFrameAccepted?.Invoke(m);
 
             if (m.is_final)
-            {
-                _playbackCompleted = true;
-                _answered = false;
-                _expectedTtsSeq = -1;
-                _playbackId = null;
-                _binding = new VoiceBinding
-                {
-                    SessionId = _sessionId,
-                    TurnId = _turnId,
-                    AudioStreamId = null,
-                    PlaybackId = null
-                };
-                Transition(VoiceClientState.Ready);
-                _turnActive = false;
-                // Reset turn/session state so a SECOND round starts a fresh
-                // session.start (new turn id) and restarts audio sequencing at 0.
-                _sessionStartSent = false;
-                _expectedAudioSeq = -1;
-            }
+                _finalTtsSequence = m.sequence;
         }
 
         private void HandleClarification(ClarificationRequiredMessage m)
         {
-            // VRR3 / P1-6: surface the server's clarification request to the UI projection.
-            // Only a live turn clarifies; anything else is stale. Accepted both from
-            // AwaitingAnswer and — P1-1, same early-endpoint family — from Capturing:
-            // a low-confidence VAD endpoint can raise clarification.required while the
-            // user is still holding the record button. The controller deliberately
-            // STAYS in its current state (design decision: the recovery policy —
-            // re-record on a new turn vs cancel/reconnect — belongs to the caller).
+            // Project the server's clarification immediately while retaining its reason
+            // for the following voice.state(status=clarification). Terminal handling
+            // projects it again after Ready so the final prompt remains visible.
             if (_state != VoiceClientState.AwaitingAnswer && _state != VoiceClientState.Capturing)
             {
                 Reject(VoiceCommandResult.StaleTurn);
                 return;
             }
-            ClarificationRequired?.Invoke(m.reason ?? string.Empty);
+            _pendingClarificationReason = m.reason ?? string.Empty;
+            _pendingClarificationTurnId = m.turn_id;
+            ClarificationRequired?.Invoke(_pendingClarificationReason);
+        }
+
+        private void HandleClarificationTerminal(VoiceStateMessage message)
+        {
+            if (_state != VoiceClientState.AwaitingAnswer && _state != VoiceClientState.Capturing)
+            {
+                Reject(VoiceCommandResult.StaleTurn);
+                return;
+            }
+
+            string reason = _pendingClarificationTurnId == message.turn_id
+                ? _pendingClarificationReason
+                : null;
+            // A low-confidence VAD result is an intermediate clarification: the server
+            // intentionally accepts another utterance on this same turn. Explicit
+            // audio.end, no-speech, ASR/pipeline failures and retrieval gates are final.
+            if (reason == "low_confidence_asr")
+                return;
+            if (!FinalizeTurn(message.session_id, message.turn_id, _connectionGeneration,
+                    discardPendingTts: true, allowInputTerminal: true))
+                return;
+            _pendingClarificationReason = null;
+            _pendingClarificationTurnId = null;
+            if (reason != null)
+                ClarificationRequired?.Invoke(reason);
         }
 
         private void HandleAsrTranscript(AsrTranscriptMessage m)
@@ -1045,7 +1400,111 @@ namespace Yilan.Voice.Runtime.Session
             };
             _sessionStartSent = true;
             _expectedAudioSeq = 0;
+            _pendingStartSessionId = _sessionId;
+            _pendingStartTurnId = _turnId;
+            _pendingStartGeneration = _connectionGeneration;
             TrySendText(JsonUtility.ToJson(start));
+        }
+
+        private bool FinalizeTurn(
+            string sessionId, string turnId, int connectionGeneration, bool discardPendingTts,
+            bool displayOnlyDegraded = false, bool allowInputTerminal = false)
+        {
+            if (!_turnActive || connectionGeneration != _connectionGeneration ||
+                sessionId != _sessionId || turnId != _turnId ||
+                (_state != VoiceClientState.Playing &&
+                 !(allowInputTerminal && (_state == VoiceClientState.Capturing ||
+                                          _state == VoiceClientState.AwaitingAnswer))))
+                return false;
+
+            _turnActive = false;
+            _sessionStartSent = false;
+            _answered = false;
+            _playbackCompleted = true;
+            ResetPlaybackCompletionFacts();
+            _expectedAudioSeq = -1;
+            _expectedTtsSeq = -1;
+            _playbackId = null;
+            _audioStreamId = null;
+            _answerStreamAccepted = false;
+            ResetAnswerStreamTurnState();
+            ClearPendingStart();
+            ClearPendingTtsError();
+            ClearPendingClarification();
+            _binding = new VoiceBinding
+            {
+                SessionId = _sessionId,
+                TurnId = _turnId,
+                AudioStreamId = null,
+                PlaybackId = null
+            };
+            if (discardPendingTts)
+                _ttsPairer = new TtsBinaryPairer(null);
+
+            if (displayOnlyDegraded)
+            {
+                _lastTtsDegradationGeneration = connectionGeneration;
+                TtsDegraded?.Invoke();
+            }
+            // All round-owned state is cleared before notifying synchronous Ready listeners.
+            if (allowInputTerminal && _state != VoiceClientState.Playing)
+            {
+                // The existing state graph deliberately routes local input cancellation
+                // through Cancelling -> Ready. The server has already terminated this turn,
+                // so this is state projection only and sends no session.cancel frame.
+                if (Transition(VoiceClientState.Cancelling) != VoiceStateTransitionCode.Ok ||
+                    Transition(VoiceClientState.Ready) != VoiceStateTransitionCode.Ok)
+                {
+                    TransitionFault("terminal_settle_failed");
+                    return false;
+                }
+            }
+            else
+            {
+                Transition(VoiceClientState.Ready);
+            }
+            return true;
+        }
+
+        private void ClearPendingStart()
+        {
+            _pendingStartSessionId = null;
+            _pendingStartTurnId = null;
+            _pendingStartGeneration = -1;
+        }
+
+        private void ResetPlaybackCompletionFacts()
+        {
+            _finalTtsSequence = -1;
+            _finalPayloadReceived = false;
+            _backendSendCompleted = false;
+            _decoderDrainCompleted = false;
+            _finalClipEnqueued = false;
+            _audioPlayerDrained = false;
+            _playbackGeneration = -1;
+            _playbackDeadlineUtc = DateTime.MinValue;
+        }
+
+        private void StartPlaybackDeadline()
+        {
+            int timeoutMs = _config.PlaybackCompletionTimeoutMs > 0
+                ? _config.PlaybackCompletionTimeoutMs
+                : Math.Max(1, _config.SendTimeoutMs);
+            DateTime now = UtcNow != null ? UtcNow() : DateTime.UtcNow;
+            _playbackDeadlineUtc = now.AddMilliseconds(timeoutMs);
+        }
+
+        private void ClearPendingTtsError()
+        {
+            _ttsErrorPending = false;
+            _ttsErrorTurnId = null;
+            _ttsErrorGeneration = -1;
+        }
+
+        private void ClearPendingClarification()
+        {
+            _pendingClarificationReason = null;
+            _pendingClarificationTurnId = null;
         }
 
         private void ResetAnswerStreamState()
@@ -1149,11 +1608,38 @@ namespace Yilan.Voice.Runtime.Session
             return code;
         }
 
-        private void TransitionFault()
+        private void TransitionFault(string reason = "internal_error", int? closeCode = null, string code = null, string field = null)
         {
             if (_state == VoiceClientState.Faulted) return;
+            _sessionTimeoutPending = false;
+            _sessionTimeoutGeneration = -1;
+            ClearPendingStart();
+            ClearPendingTtsError();
+            ClearPendingClarification();
+            LastFaultReason = SafeToken(reason);
+            LastFaultCode = SafeToken(code);
+            LastFaultField = SafeToken(field);
+            if (closeCode.HasValue) LastCloseCode = closeCode.Value;
             _state = VoiceClientState.Faulted;
+            FaultReasonChanged?.Invoke(LastFaultReason);
             StateChanged?.Invoke(VoiceClientState.Faulted);
+        }
+
+        private static string SafeProtocolField(string detail, string fallback)
+        {
+            string[] fields = { "type", "protocol_version", "session_id", "turn_id", "audio_stream_id", "playback_id", "audio_seq", "sequence", "codec", "is_final", "code", "field", "status", "answer", "reason", "request_id", "payload" };
+            if (!string.IsNullOrEmpty(detail))
+                foreach (string candidate in fields)
+                    if (detail.IndexOf(candidate, StringComparison.Ordinal) >= 0) return candidate;
+            return fallback ?? string.Empty;
+        }
+
+        private static string SafeToken(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length > 64) return string.Empty;
+            foreach (char c in value)
+                if (!(char.IsLetterOrDigit(c) || c == '_' || c == '-' || c == '.')) return string.Empty;
+            return value;
         }
 
         private void Reject(VoiceCommandResult code)
@@ -1178,6 +1664,8 @@ namespace Yilan.Voice.Runtime.Session
                 _socket.Error -= OnError;
                 _socket.Closed -= OnClosed;
             }
+            if (_playback != null)
+                _playback.PlaybackCompleted -= OnDecoderPlaybackCompleted;
         }
     }
 }

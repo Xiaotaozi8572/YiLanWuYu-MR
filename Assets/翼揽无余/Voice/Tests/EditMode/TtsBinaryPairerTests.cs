@@ -75,6 +75,42 @@ namespace Yilan.Voice.Protocol
         }
 
         [Test]
+        public void FinalHeader_RemainsPendingUntilItsBinaryAndRejectsADuplicateBody()
+        {
+            var h = new TtsFrameMessage
+            {
+                type = "tts.frame",
+                session_id = "vr-test-session-001",
+                turn_id = "turn-0001",
+                playback_id = "playback-final",
+                sequence = 4,
+                codec = "mp3",
+                duration_ms = 20,
+                is_final = true
+            };
+            var pairer = new TtsBinaryPairer(new VoiceBinding
+            {
+                SessionId = h.session_id,
+                TurnId = h.turn_id,
+                PlaybackId = h.playback_id
+            });
+
+            var header = pairer.OnTextHeader(h);
+            Assert.AreEqual(TtsPairCode.HeaderAccepted, header.Code);
+            Assert.IsTrue(pairer.HasPending, "is_final does not consume or discard the pending header");
+            Assert.AreSame(h, pairer.PendingHeader);
+
+            var body = pairer.OnBinary(new byte[640]);
+            Assert.AreEqual(TtsPairCode.HeaderConsumed, body.Code);
+            Assert.IsTrue(body.Header.is_final);
+            Assert.IsFalse(pairer.HasPending);
+
+            var duplicateBody = pairer.OnBinary(new byte[640]);
+            Assert.AreEqual(TtsPairCode.BareBinary, duplicateBody.Code,
+                "a second binary cannot be paired with the already-consumed final header");
+        }
+
+        [Test]
         public void CanonicalSequence_PairsAllHeaders()
         {
             var w = JsonUtility.FromJson<TtsSeqWrapper>(Fixture("tts_header_binary_sequence.json"));

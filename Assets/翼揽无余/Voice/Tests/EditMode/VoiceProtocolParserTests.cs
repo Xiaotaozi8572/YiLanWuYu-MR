@@ -32,8 +32,39 @@ namespace Yilan.Voice.Protocol
         private static string FixturesDir =>
             Path.Combine(Application.dataPath, "翼揽无余", "Voice", "Fixtures", "voice_ws_v1");
 
+        private static string AnswerStreamFixturesDir =>
+            Path.Combine(Application.dataPath, "翼揽无余", "Voice", "Fixtures", "voice_answer_stream_v1");
+
         private static string Fixture(string name) =>
             File.ReadAllText(Path.Combine(FixturesDir, name));
+
+        private static string ExtractRootObject(string json, string propertyName)
+        {
+            var marker = "\"" + propertyName + "\"";
+            int property = json.IndexOf(marker, StringComparison.Ordinal);
+            Assert.GreaterOrEqual(property, 0, "fixture property not found: " + propertyName);
+            int start = json.IndexOf('{', property + marker.Length);
+            Assert.GreaterOrEqual(start, 0, "fixture object not found: " + propertyName);
+            int depth = 0;
+            bool inString = false;
+            bool escaped = false;
+            for (int index = start; index < json.Length; index++)
+            {
+                char c = json[index];
+                if (inString)
+                {
+                    if (escaped) escaped = false;
+                    else if (c == '\\') escaped = true;
+                    else if (c == '"') inString = false;
+                    continue;
+                }
+                if (c == '"') inString = true;
+                else if (c == '{') depth++;
+                else if (c == '}' && --depth == 0) return json.Substring(start, index - start + 1);
+            }
+            Assert.Fail("fixture object is unterminated: " + propertyName);
+            return null;
+        }
 
         // ---- Legal gold samples all parse OK ----
 
@@ -86,6 +117,54 @@ namespace Yilan.Voice.Protocol
             var m = (AnswerDisplayMessage)res.Message;
             Assert.IsNotNull(m.answer);
             Assert.IsNotEmpty(m.answer.source);
+        }
+
+        [Test]
+        public void AnswerDisplay_RecoveryNullEvidence_ParsesAndRemainsUnverified()
+        {
+            const string json = "{\"type\":\"answer.display\",\"session_id\":\"s1\",\"turn_id\":\"t1\",\"answer_id\":\"a1\",\"evidence_package_id\":null,\"answer\":{\"content\":\"authorized text\",\"source\":\"\"}}";
+            var result = VoiceProtocolParser.Parse(json);
+            Assert.AreEqual(VoiceParseCode.Ok, result.Code, result.Reason);
+            var message = (AnswerDisplayMessage)result.Message;
+            Assert.IsTrue(string.IsNullOrEmpty(message.evidence_package_id));
+            Assert.AreEqual("authorized text", message.answer.content);
+            Assert.IsEmpty(message.answer.source);
+        }
+
+        [Test]
+        public void DirectReplacementFixture_ParsesNullEvidenceAndFormalDisplayText()
+        {
+            var fixture = File.ReadAllText(
+                Path.Combine(AnswerStreamFixturesDir, "direct_replacement.json"));
+            var final = ExtractRootObject(fixture, "final");
+            var result = VoiceProtocolParser.Parse(final);
+            Assert.AreEqual(VoiceParseCode.Ok, result.Code, result.Reason);
+            var message = (AnswerDisplayMessage)result.Message;
+            Assert.IsTrue(string.IsNullOrEmpty(message.evidence_package_id));
+            Assert.AreEqual("Qwen直答新正文。", message.answer.content);
+            Assert.IsEmpty(message.answer.source);
+        }
+
+        [TestCase("\"evidence_package_id\":null", VoiceParseCode.Ok)]
+        [TestCase("\"evidence_package_id\":\"evidence-1\"", VoiceParseCode.Ok)]
+        [TestCase("\"evidence_package_id\":\"\"", VoiceParseCode.MissingRequiredField)]
+        [TestCase("\"evidence_package_id\":7", VoiceParseCode.InvalidJson)]
+        [TestCase("\"evidence_package_id\":true", VoiceParseCode.InvalidJson)]
+        [TestCase("\"evidence_package_id\":{}", VoiceParseCode.InvalidJson)]
+        [TestCase("\"evidence_package_id\":[]", VoiceParseCode.InvalidJson)]
+        public void AnswerDisplay_EvidencePackageIdTypeIsStrict(string field, VoiceParseCode expected)
+        {
+            var json = "{\"type\":\"answer.display\",\"session_id\":\"s1\",\"turn_id\":\"t1\",\"answer_id\":\"a1\"," + field + ",\"answer\":{\"content\":\"text\",\"source\":\"\"}}";
+            var result = VoiceProtocolParser.Parse(json);
+            Assert.AreEqual(expected, result.Code, result.Reason);
+        }
+
+        [Test]
+        public void AnswerDisplay_MissingEvidencePackageId_RemainsRejected()
+        {
+            const string json = "{\"type\":\"answer.display\",\"session_id\":\"s1\",\"turn_id\":\"t1\",\"answer_id\":\"a1\",\"answer\":{\"content\":\"text\",\"source\":\"\"}}";
+            var result = VoiceProtocolParser.Parse(json);
+            Assert.AreEqual(VoiceParseCode.MissingRequiredField, result.Code);
         }
 
         [Test]

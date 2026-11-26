@@ -3008,11 +3008,18 @@ MonoBehaviour:
   rotationTarget: {fileID: 2044582953}
   pinchEnterDistance: 0.025
   pinchExitDistance: 0.04
-  rotationSensitivity: 1
+  rotationMode: 0
+  rotationCenter: {fileID: 0}
+  rotationSensitivity: 180
+  twoHandTwistSensitivity: 1
+  pitchSensitivity: 120
+  enableTwoHandScaling: 1
+  scaleSensitivity: 1
+  movementDeadZone: 0.002
   invertRotationDirection: 0
   angleDeadZone: 0.15
-  maxDegreesPerFrame: 6
-  smoothTime: 0.06
+  maxDegreesPerFrame: 12
+  smoothTime: 0.035
   hotspotInteractables:
   - {fileID: 2022412460}
   - {fileID: 0}

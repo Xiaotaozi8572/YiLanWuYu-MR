@@ -18,6 +18,7 @@ using System.Text;
 using System.Threading.Tasks;
 using NUnit.Framework;
 using UnityEngine;
+using Yilan.Voice.Runtime.Playback;
 using Yilan.Voice.Runtime.Protocol;
 using Yilan.Voice.Runtime.Session;
 using Yilan.Voice.Runtime.Transport;
@@ -60,6 +61,7 @@ namespace Yilan.Voice.Runtime.UI
         }
 
         public void SimulatePayload(string json) => Enqueue(() => Payload?.Invoke(Encoding.UTF8.GetBytes(json)));
+        public void SimulatePayload(byte[] payload) => Enqueue(() => Payload?.Invoke(payload));
 
         public void SimulateServerClose(int code, string reason)
             => Enqueue(() => Closed?.Invoke(new VoiceCloseInfo(code, VoiceCloseMapper.Classify(code), reason)));
@@ -136,6 +138,19 @@ namespace Yilan.Voice.Runtime.UI
                 }
             });
 
+        private static string ReasoningJson(string sessionId, string turnId, int sequence, int attempt, string text)
+            => JsonUtility.ToJson(new AnswerEventMessage
+            {
+                type = "answer.event",
+                schema_version = 1,
+                event_type = "reasoning.delta",
+                request_id = "run-1",
+                session_id = sessionId,
+                turn_id = turnId,
+                sequence = sequence,
+                payload = new AnswerStreamPayload { attempt = attempt, text = text }
+            });
+
         private static string AnswerJson(string sessionId, string turnId, string content, string answerId = "ans-1")
             => JsonUtility.ToJson(new AnswerDisplayMessage
             {
@@ -163,6 +178,16 @@ namespace Yilan.Voice.Runtime.UI
         private static string VoiceErrorJson(string code, string field)
             => JsonUtility.ToJson(new VoiceErrorMessage { type = "voice.error", code = code, field = field });
 
+        private static string PlaybackFailedJson(string sessionId, string turnId)
+            => JsonUtility.ToJson(new VoiceStateMessage
+            {
+                type = "voice.state",
+                session_id = sessionId,
+                turn_id = turnId,
+                state = "clarify",
+                status = "playback.failed"
+            });
+
         private static string AsrJson(string sessionId, string turnId, string type, string transcript)
             => JsonUtility.ToJson(new AsrTranscriptMessage
             {
@@ -185,12 +210,55 @@ namespace Yilan.Voice.Runtime.UI
 
         // ---- harness helpers: connect through the real controller to Ready ----
 
-        private static (VoiceSessionController controller, ProjectionFakeSocket socket, VoiceViewModel vm) NewHarness()
+        private sealed class ProjectionFakePlayback : ITtsPlayback
+        {
+            public bool HasQueued { get; private set; }
+            public bool IsPlaying { get; private set; }
+            public event Action<TtsPlayedItem> FramePlayed;
+            public event Action<string> FrameDecodeFailed;
+            public event Action<string> PlaybackCompleted;
+
+            public TtsPlaybackCode EnqueueTts(TtsFrameMessage header, byte[] mp3)
+            {
+                HasQueued = true;
+                return TtsPlaybackCode.Accepted;
+            }
+
+            public void CompleteDecode(string playbackId)
+            {
+                HasQueued = false;
+                PlaybackCompleted?.Invoke(playbackId);
+            }
+
+            public void Cancel() { HasQueued = IsPlaying = false; }
+            public void Dispose()
+            {
+                FramePlayed = null;
+                FrameDecodeFailed = null;
+                PlaybackCompleted = null;
+            }
+        }
+
+        private static (VoiceSessionController controller, ProjectionFakeSocket socket, VoiceViewModel vm) NewHarness(
+            ITtsPlayback playback = null)
         {
             var socket = new ProjectionFakeSocket();
-            var controller = new VoiceSessionController(Cfg, socket);
+            var controller = new VoiceSessionController(Cfg, socket, playback);
             var vm = new VoiceViewModel(controller);
             return (controller, socket, vm);
+        }
+
+        private static void CompleteRoundThroughPlayer(
+            VoiceSessionController controller, ProjectionFakeSocket socket,
+            ProjectionFakePlayback playback, string playbackId)
+        {
+            socket.SimulatePayload(TtsJson(controller.SessionId, controller.TurnId, playbackId, 0, true));
+            socket.DispatchMessageQueue();
+            socket.SimulatePayload(new byte[640]);
+            socket.DispatchMessageQueue();
+            playback.CompleteDecode(playbackId);
+            controller.ReportPlaybackClipEnqueued(playbackId, 0, 1);
+            controller.ReportAudioPlaybackDrained(playbackId, 1);
         }
 
         private static void ConnectToReady(VoiceSessionController c, ProjectionFakeSocket s)
@@ -286,6 +354,64 @@ namespace Yilan.Voice.Runtime.UI
         }
 
         [Test]
+        public void Ui_ReasoningDeltas_AreAccumulatedAndAutoCollapseWhenAnswerStarts()
+        {
+            var (c, s, vm) = NewHarness();
+            ConnectToReady(c, s);
+            c.RecordStartAsync();
+            c.RecordEndAsync();
+
+            string first = new string('思', 1201) + "🙂";
+            s.SimulatePayload(ReasoningJson(c.SessionId, c.TurnId, 1, 1, first));
+            s.SimulatePayload(ReasoningJson(c.SessionId, c.TurnId, 2, 1, "继续分析。"));
+            s.DispatchMessageQueue();
+            Assert.AreEqual(first + "继续分析。", vm.ReasoningText);
+            Assert.IsTrue(vm.HasReasoning);
+            Assert.IsTrue(vm.ReasoningExpanded);
+
+            s.SimulatePayload(AnswerBlockJson(c.SessionId, c.TurnId, 3, 1, "答案开始。"));
+            s.DispatchMessageQueue();
+            Assert.IsFalse(vm.ReasoningExpanded);
+            Assert.AreEqual(first + "继续分析。", vm.ReasoningText, "answer blocks must not clear reasoning");
+
+            s.SimulatePayload(AnswerJson(c.SessionId, c.TurnId, "最终答案。"));
+            s.DispatchMessageQueue();
+            Assert.AreEqual(first + "继续分析。", vm.ReasoningText, "final answer must preserve reasoning for review");
+
+            c.Dispose();
+            vm.Dispose();
+            s.Dispose();
+        }
+
+        [Test]
+        public void Ui_ManualReasoningChoice_PersistsAcrossDeltasAndAttempts()
+        {
+            var (c, s, vm) = NewHarness();
+            ConnectToReady(c, s);
+            c.RecordStartAsync();
+            c.RecordEndAsync();
+
+            s.SimulatePayload(ReasoningJson(c.SessionId, c.TurnId, 1, 1, "第一轮思考。"));
+            s.DispatchMessageQueue();
+            vm.SetReasoningExpanded(false);
+            s.SimulatePayload(ReasoningJson(c.SessionId, c.TurnId, 2, 1, "追加思考。"));
+            s.DispatchMessageQueue();
+            Assert.IsFalse(vm.ReasoningExpanded);
+            Assert.AreEqual("第一轮思考。追加思考。", vm.ReasoningText);
+
+            s.SimulatePayload(ReasoningJson(c.SessionId, c.TurnId, 3, 2, "备用思考。"));
+            s.DispatchMessageQueue();
+            Assert.AreEqual("备用思考。", vm.ReasoningText, "new attempt replaces old attempt reasoning");
+            Assert.IsFalse(vm.ReasoningExpanded, "manual choice persists across attempts");
+            vm.SetReasoningExpanded(true);
+            Assert.IsTrue(vm.ReasoningExpanded);
+
+            c.Dispose();
+            vm.Dispose();
+            s.Dispose();
+        }
+
+        [Test]
         public void Ui_DuplicateAnswerForCurrentTurn_IsRejected_NotReprojected()
         {
             var (c, s, vm) = NewHarness();
@@ -345,7 +471,8 @@ namespace Yilan.Voice.Runtime.UI
         [Test]
         public void Ui_Transcripts_ProjectPartialThenFinal_ClearedOnNewRound()
         {
-            var (c, s, vm) = NewHarness();
+            var playback = new ProjectionFakePlayback();
+            var (c, s, vm) = NewHarness(playback);
             ConnectToReady(c, s);
             c.RecordStartAsync();
             c.RecordEndAsync();
@@ -364,8 +491,7 @@ namespace Yilan.Voice.Runtime.UI
             // Complete the round, then a NEW round must clear the old transcript.
             s.SimulatePayload(AnswerJson(c.SessionId, c.TurnId, "回答。"));
             s.DispatchMessageQueue();
-            s.SimulatePayload(TtsJson(c.SessionId, c.TurnId, "playback_server1", 0, true));
-            s.DispatchMessageQueue();
+            CompleteRoundThroughPlayer(c, s, playback, "playback_server1");
             Assert.AreEqual(VoiceClientState.Ready, c.State);
 
             c.RecordStartAsync();
@@ -452,7 +578,7 @@ namespace Yilan.Voice.Runtime.UI
         // ============================ error -> Faulted ==================================
 
         [Test]
-        public void Ui_VoiceError_ProjectsFaulted()
+        public void Ui_VoiceSessionTimeout_WaitsFor4408AndProjectsIdle()
         {
             var (c, s, vm) = NewHarness();
             ConnectToReady(c, s);
@@ -460,9 +586,17 @@ namespace Yilan.Voice.Runtime.UI
 
             s.SimulatePayload(VoiceErrorJson("VOICE_SESSION_TIMEOUT", "session.start"));
             s.DispatchMessageQueue();
+            Assert.AreEqual(VoiceClientState.Cancelling, c.State,
+                "the timeout error starts cleanup and waits for the close result");
+            Assert.AreEqual(VoiceUiState.Cancelling, vm.State);
 
-            Assert.AreEqual(VoiceUiState.Faulted, vm.State);
-            Assert.AreEqual(VoiceClientState.Faulted, c.State);
+            s.SimulateServerClose(4408, "voice session timeout");
+            s.DispatchMessageQueue();
+
+            Assert.AreEqual(VoiceUiState.Idle, vm.State);
+            Assert.AreEqual(VoiceClientState.Idle, c.State);
+            Assert.AreEqual(4408, c.LastCloseCode);
+            Assert.AreEqual("会话超时，点击重新提问", vm.HintText);
 
             c.Dispose();
             vm.Dispose();
@@ -683,6 +817,11 @@ namespace Yilan.Voice.Runtime.UI
             s.SimulatePayload(VoiceErrorJson("VOICE_TTS_ERROR", "tts"));
             s.DispatchMessageQueue();
 
+            Assert.AreEqual(VoiceClientState.Playing, c.State,
+                "an unscoped error alone must wait for the turn-bound playback result");
+            s.SimulatePayload(PlaybackFailedJson(c.SessionId, c.TurnId));
+            s.DispatchMessageQueue();
+
             Assert.AreEqual(VoiceClientState.Ready, c.State);
             Assert.AreEqual(content, vm.AnswerText, "the fixed answer stays on screen");
             Assert.AreEqual("语音播报不可用，已显示文字回答", vm.HintText);
@@ -702,7 +841,8 @@ namespace Yilan.Voice.Runtime.UI
         [Test]
         public void Ui_SecondRound_ClearsFixedAnswer_ThenProjectsNewContent()
         {
-            var (c, s, vm) = NewHarness();
+            var playback = new ProjectionFakePlayback();
+            var (c, s, vm) = NewHarness(playback);
             ConnectToReady(c, s);
 
             // ---- Round 1: answer fixed once ----
@@ -714,9 +854,8 @@ namespace Yilan.Voice.Runtime.UI
             Assert.AreEqual(first, vm.AnswerText);
             Assert.IsTrue(vm.AnswerFixed);
 
-            // Complete playback (final tts) so the controller returns to Ready.
-            s.SimulatePayload(TtsJson(c.SessionId, c.TurnId, "playback_server1", 0, true));
-            s.DispatchMessageQueue();
+            // Completion requires body pairing, decoder drain, final clip acceptance and player drain.
+            CompleteRoundThroughPlayer(c, s, playback, "playback_server1");
             Assert.AreEqual(VoiceClientState.Ready, c.State);
 
             // ---- Round 2: a new turn must CLEAR the previous fixed answer, then project fresh ----

@@ -1,7 +1,12 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Reflection;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using NUnit.Framework;
+using UnityEngine;
 using Yilan.Voice.Runtime.Bootstrap;
 using Yilan.Voice.Runtime.Capture;
 using Yilan.Voice.Runtime.Metrics;
@@ -10,6 +15,7 @@ using Yilan.Voice.Runtime.Playback;
 using Yilan.Voice.Runtime.Session;
 using Yilan.Voice.Runtime.Transport;
 using Yilan.Voice.Transport;
+using UnityEngine.TestTools;
 
 namespace Yilan.Voice.Remediation
 {
@@ -48,6 +54,164 @@ namespace Yilan.Voice.Remediation
             Assert.AreEqual(1, socket.ConnectCalls);
             Assert.IsNotNull(runtime.Controller);
             Assert.IsNotNull(runtime.ViewModel);
+        }
+
+        [UnityTest]
+        public IEnumerator BeginCaptureFromIdle_WaitsForMatchingStartedAckAndCoalescesClicks()
+        {
+            var socket = new FakeVoiceSocket();
+            var runtime = CreateRuntimeWithDevice(socket, out var device, out var microphone);
+            int callerThreadId = Thread.CurrentThread.ManagedThreadId;
+            var first = runtime.BeginCaptureAsync();
+            Assert.IsNotNull(runtime.Controller);
+            Assert.AreNotEqual(VoiceClientState.Capturing, runtime.Controller.State,
+                "capture must wait until the server ACK is delivered");
+            Assert.IsFalse(first.IsCompleted, "the first intent should still be waiting for the server ACK");
+            var duplicate = runtime.BeginCaptureAsync();
+
+            Assert.AreSame(first, duplicate,
+                $"overlapping record intents must share one handshake (state={runtime.Controller.State}, recording={microphone.IsRecording}, complete={first.IsCompleted})");
+            Assert.IsFalse(microphone.IsRecording, "the microphone must stay closed before session.started");
+            Assert.IsFalse(first.IsCompleted);
+
+            socket.DispatchMessageQueue(); // Opened -> session.start; ACK has not arrived yet.
+            Assert.IsFalse(microphone.IsRecording);
+            socket.SimulatePayload(System.Text.Encoding.UTF8.GetBytes(StartedJson(runtime)));
+            socket.DispatchMessageQueue();
+
+            float deadline = Time.realtimeSinceStartup + 2f;
+            while (!first.IsCompleted && Time.realtimeSinceStartup < deadline) yield return null;
+            Assert.IsTrue(first.IsCompleted, "the matching ACK should release the shared start intent");
+            Assert.AreEqual(VoiceCommandResult.Ok, first.GetAwaiter().GetResult());
+            Assert.AreEqual(VoiceClientState.Capturing, runtime.Controller.State);
+            Assert.IsTrue(microphone.IsRecording);
+            Assert.AreEqual(callerThreadId, device.StartThreadId);
+
+            runtime.Dispose();
+        }
+
+        [UnityTest]
+        public IEnumerator BeginCaptureWithSynchronousStartedAck_OpensMicOnlyAfterAck()
+        {
+            var socket = new ImmediateAckSocket();
+            var runtime = CreateRuntimeWithDevice(socket, out var device, out var microphone);
+
+            var start = runtime.BeginCaptureAsync();
+            Assert.IsFalse(microphone.IsRecording);
+            float deadline = Time.realtimeSinceStartup + 2f;
+            while (!start.IsCompleted && Time.realtimeSinceStartup < deadline) yield return null;
+
+            Assert.IsTrue(start.IsCompleted);
+            Assert.AreEqual(VoiceCommandResult.Ok, start.GetAwaiter().GetResult());
+            Assert.AreEqual(1, socket.ConnectCalls);
+            Assert.AreEqual(1, device.StartCalls);
+            Assert.AreEqual(Thread.CurrentThread.ManagedThreadId, device.StartThreadId);
+            Assert.IsTrue(microphone.IsRecording);
+            runtime.Dispose();
+        }
+
+        [Test]
+        public void BeginCaptureHandshakeFault_DoesNotOpenMic()
+        {
+            var socket = new ImmediateAckSocket { MismatchSession = true };
+            var runtime = CreateRuntimeWithDevice(socket, out var device, out var microphone);
+
+            var start = runtime.BeginCaptureAsync();
+
+            Assert.AreEqual(VoiceCommandResult.Faulted, start.GetAwaiter().GetResult());
+            Assert.AreEqual(VoiceClientState.Faulted, runtime.Controller.State);
+            Assert.AreEqual(0, device.StartCalls);
+            Assert.IsFalse(microphone.IsRecording);
+            runtime.Dispose();
+        }
+
+        [UnityTest]
+        public IEnumerator DestroyDuringCaptureHandshakeInvalidatesPendingIntent()
+        {
+            var socket = new FakeVoiceSocket();
+            var runtime = CreateRuntimeWithDevice(socket, out var device, out var microphone);
+            var start = runtime.BeginCaptureAsync();
+            Assert.IsFalse(start.IsCompleted);
+            runtime.Dispose();
+
+            float deadline = Time.realtimeSinceStartup + 2f;
+            while (!start.IsCompleted && Time.realtimeSinceStartup < deadline) yield return null;
+            Assert.IsTrue(start.IsCompleted);
+            Assert.AreEqual(VoiceCommandResult.InvalidState, start.GetAwaiter().GetResult());
+            Assert.AreEqual(0, device.StartCalls);
+            Assert.IsFalse(microphone.IsRecording);
+        }
+
+        [UnityTest]
+        public IEnumerator CancelledCaptureIntentDoesNotOpenMicAndCanBeRetried()
+        {
+            var socket = new FakeVoiceSocket();
+            var runtime = CreateRuntimeWithDevice(socket, out var device, out var microphone);
+            var cancelled = runtime.BeginCaptureAsync();
+            Assert.AreSame(cancelled, runtime.BeginCaptureAsync());
+            Assert.IsFalse(microphone.IsRecording);
+
+            Assert.AreEqual(VoiceCommandResult.InvalidState, runtime.EndCaptureAsync().GetAwaiter().GetResult());
+            float deadline = Time.realtimeSinceStartup + 2f;
+            while (!cancelled.IsCompleted && Time.realtimeSinceStartup < deadline) yield return null;
+            Assert.IsTrue(cancelled.IsCompleted);
+            Assert.AreEqual(VoiceCommandResult.InvalidState, cancelled.GetAwaiter().GetResult());
+            Assert.AreEqual(0, device.StartCalls);
+
+            var retry = runtime.BeginCaptureAsync();
+            socket.DispatchMessageQueue();
+            socket.SimulatePayload(System.Text.Encoding.UTF8.GetBytes(StartedJson(runtime)));
+            socket.DispatchMessageQueue();
+            deadline = Time.realtimeSinceStartup + 2f;
+            while (!retry.IsCompleted && Time.realtimeSinceStartup < deadline) yield return null;
+            Assert.IsTrue(retry.IsCompleted);
+            Assert.AreEqual(VoiceCommandResult.Ok, retry.GetAwaiter().GetResult());
+            Assert.AreEqual(1, device.StartCalls, "a canceled intent must not start the microphone; retry starts it once");
+            runtime.Dispose();
+        }
+
+        [UnityTest]
+        public IEnumerator FaultedResetClosesOldSocketRebuildsAndWaitsForNewAckBeforeCapture()
+        {
+            var oldSocket = new FakeVoiceSocket();
+            var runtime = CreateRuntimeWithDevice(oldSocket, out var device, out var microphone);
+            runtime.StartAsync().GetAwaiter().GetResult();
+            oldSocket.DispatchMessageQueue();
+            oldSocket.SimulatePayload(System.Text.Encoding.UTF8.GetBytes(StartedJson(runtime)));
+            oldSocket.DispatchMessageQueue();
+            oldSocket.SimulateError(new VoiceSocketError(VoiceSocketErrorKind.Unexpected, "test"));
+            oldSocket.DispatchMessageQueue();
+            Assert.AreEqual(VoiceClientState.Faulted, runtime.Controller.State);
+
+            var newSocket = new FakeVoiceSocket();
+            typeof(VoiceClientRuntime).GetField("_socketFactory", BindingFlags.Instance | BindingFlags.NonPublic)
+                .SetValue(runtime, (Func<IVoiceSocket>)(() => newSocket));
+            var reset = (Task<VoiceCommandResult>)typeof(VoiceClientRuntime)
+                .GetMethod("ResetFaultedAsync", BindingFlags.Instance | BindingFlags.NonPublic)
+                .Invoke(runtime, null);
+            float deadline = Time.realtimeSinceStartup + 3f;
+            while (!reset.IsCompleted && Time.realtimeSinceStartup < deadline) yield return null;
+
+            Assert.IsTrue(reset.IsCompleted);
+            Assert.AreEqual(VoiceCommandResult.Ok, reset.GetAwaiter().GetResult());
+            Assert.AreEqual(1, oldSocket.CloseCalls);
+            Assert.Throws<ObjectDisposedException>(() => oldSocket.ConnectAsync(Cfg.BuildWsUri()).GetAwaiter().GetResult());
+            Assert.AreSame(newSocket, runtime.Socket);
+            Assert.AreEqual(VoiceClientState.Connecting, runtime.Controller.State);
+            Assert.IsFalse(microphone.IsRecording);
+            StringAssert.Contains("连接已清理", runtime.ViewModel.HintText);
+
+            var start = runtime.BeginCaptureAsync();
+            Assert.IsFalse(microphone.IsRecording);
+            newSocket.DispatchMessageQueue();
+            newSocket.SimulatePayload(System.Text.Encoding.UTF8.GetBytes(StartedJson(runtime)));
+            newSocket.DispatchMessageQueue();
+            deadline = Time.realtimeSinceStartup + 2f;
+            while (!start.IsCompleted && Time.realtimeSinceStartup < deadline) yield return null;
+            Assert.IsTrue(start.IsCompleted);
+            Assert.AreEqual(VoiceCommandResult.Ok, start.GetAwaiter().GetResult());
+            Assert.AreEqual(1, device.StartCalls);
+            runtime.Dispose();
         }
 
         [Test]
@@ -244,6 +408,19 @@ namespace Yilan.Voice.Remediation
             return CreateRuntime(socket, healthOk, out _, out _, out _);
         }
 
+        private static VoiceClientRuntime CreateRuntimeWithDevice(
+            IVoiceSocket socket,
+            out FakeMicrophoneDevice device,
+            out UnityMicrophoneSource microphone)
+        {
+            var permission = new PicoMicrophonePermission(new FakePermissionPlatform { Granted = true, CanAskAgain = true });
+            device = new FakeMicrophoneDevice();
+            microphone = new UnityMicrophoneSource(device, () => permission.HasPermission);
+            var playback = new RecordingPlayback();
+            var metrics = new VoiceMetricsRecorder(new VoiceIdHasher("vrr1-test-salt"), directory: System.IO.Path.GetTempPath(), isDevBuild: () => false);
+            return new VoiceClientRuntime(Cfg, socket, _ => Task.FromResult(true), permission, microphone, playback, metrics);
+        }
+
         /// <summary>Server-style voice.state(session.started, voice-ws-v1) wire frame for the
         /// runtime's own controller (ids are echoed from the session.start it sent).</summary>
         private static string StartedJson(VoiceClientRuntime runtime)
@@ -271,16 +448,70 @@ namespace Yilan.Voice.Remediation
             public void RequestPermission() { }
         }
 
+        private sealed class ImmediateAckSocket : IVoiceSocket
+        {
+            public event VoiceSocketOpenedHandler Opened;
+            public event VoiceSocketPayloadHandler Payload;
+            public event VoiceSocketErrorHandler Error;
+            public event VoiceSocketClosedHandler Closed;
+            public bool IsOpen { get; private set; }
+            public bool MismatchSession;
+            public int ConnectCalls { get; private set; }
+            public System.Collections.Generic.List<string> SentTexts { get; } = new System.Collections.Generic.List<string>();
+
+            public Task ConnectAsync(Uri url, int timeoutMs = 0)
+            {
+                ConnectCalls++;
+                IsOpen = true;
+                Opened?.Invoke();
+                return Task.CompletedTask;
+            }
+
+            public Task SendTextAsync(string text, int timeoutMs = 0)
+            {
+                SentTexts.Add(text);
+                if (text.Contains("\"type\":\"session.start\""))
+                {
+                    var start = JsonUtility.FromJson<Yilan.Voice.Runtime.Protocol.SessionStartMessage>(text);
+                    var ack = new Yilan.Voice.Runtime.Protocol.VoiceStateMessage
+                    {
+                        type = "voice.state",
+                        session_id = MismatchSession ? "other-session" : start.session_id,
+                        turn_id = start.turn_id,
+                        state = "listening",
+                        status = "session.started",
+                        protocol_version = Yilan.Voice.Runtime.Protocol.VoiceProtocolParser.WireVersion
+                    };
+                    Payload?.Invoke(Encoding.UTF8.GetBytes(JsonUtility.ToJson(ack)));
+                }
+                return Task.CompletedTask;
+            }
+
+            public Task SendBinaryAsync(byte[] data, int timeoutMs = 0) => Task.CompletedTask;
+            public Task CloseAsync(int code, string reason, int timeoutMs = 0)
+            {
+                IsOpen = false;
+                Closed?.Invoke(new VoiceCloseInfo(code, VoiceCloseMapper.Classify(code), reason));
+                return Task.CompletedTask;
+            }
+            public void DispatchMessageQueue() { }
+            public void Dispose() { IsOpen = false; Opened = null; Payload = null; Error = null; Closed = null; }
+        }
+
         private sealed class FakeMicrophoneDevice : IMicrophoneDevice
         {
             public string DeviceName => "fake";
             public int Channels => 1;
             public int DeviceSampleRate => Pcm16AudioConstants.SampleRateHz;
             public bool IsRecording { get; private set; }
+            public int StartCalls { get; private set; }
+            public int StartThreadId { get; private set; }
             public int CapacitySamples => Pcm16AudioConstants.SampleRateHz;
 
             public bool Start(string deviceName, int sampleRate, int channels, int lengthSec)
             {
+                StartCalls++;
+                StartThreadId = Thread.CurrentThread.ManagedThreadId;
                 IsRecording = true;
                 return true;
             }

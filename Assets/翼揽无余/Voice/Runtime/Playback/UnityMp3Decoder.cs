@@ -37,6 +37,14 @@ namespace Yilan.Voice.Runtime.Playback
     /// </summary>
     public sealed class UnityMp3Decoder : ITtsDecoder
     {
+        private readonly int _timeoutSeconds;
+
+        public UnityMp3Decoder(int playbackCompletionTimeoutMs = 90000)
+        {
+            int timeoutMs = playbackCompletionTimeoutMs > 0 ? playbackCompletionTimeoutMs : 90000;
+            _timeoutSeconds = Math.Max(1, (int)Math.Ceiling(timeoutMs / 1000d));
+        }
+
         /// <summary>Build a local file:// absolute URI for an on-disk path (no network access).</summary>
         public static string LocalFileUri(string filePath)
         {
@@ -47,12 +55,13 @@ namespace Yilan.Voice.Runtime.Playback
         public async Task<TtsDecodeResult> DecodeAsync(string filePath)
         {
             if (string.IsNullOrEmpty(filePath))
-                return TtsDecodeResult.Fail("missing_path");
+                return TtsDecodeResult.Fail("mp3_decode");
 
             UnityWebRequest request = null;
             try
             {
                 request = UnityWebRequestMultimedia.GetAudioClip(LocalFileUri(filePath), AudioType.MPEG);
+                request.timeout = _timeoutSeconds;
                 var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                 AsyncOperation op = request.SendWebRequest();
                 op.completed += _ => tcs.TrySetResult(true);
@@ -64,15 +73,17 @@ namespace Yilan.Voice.Runtime.Playback
                     // MPEG decode failed. Per spec we DO NOT fall back to MediaPlayer and DO NOT add a
                     // codec library; we record the failure (待确认 for the device) and stop the item while
                     // the already-displayed answer text stays (text downgrade). No raw bytes are logged.
-                    return TtsDecodeResult.Fail("decode_fail");
+                    return TtsDecodeResult.Fail("mp3_decode");
                 }
 
                 AudioClip clip = handler.audioClip;
+                if (clip.samples <= 0 || clip.length <= 0f || clip.loadState != AudioDataLoadState.Loaded)
+                    return TtsDecodeResult.Fail("mp3_decode");
                 return TtsDecodeResult.Ok(clip);
             }
             catch
             {
-                return TtsDecodeResult.Fail("decode_exception");
+                return TtsDecodeResult.Fail("mp3_decode");
             }
             finally
             {

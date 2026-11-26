@@ -2,7 +2,8 @@
     "name": "Yilan.Voice.Runtime",
     "rootNamespace": "Yilan.Voice.Runtime",
     "references": [
-        "colyseus.nativewebsocket"
+        "colyseus.nativewebsocket",
+        "Unity.TextMeshPro"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],

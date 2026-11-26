@@ -126,14 +126,170 @@ namespace Yilan.Voice.Runtime.Protocol
 
         private static VoiceParseResult ParseAnswerDisplay(string json, VoiceBinding binding)
         {
+            bool evidencePresent;
+            bool evidenceIsNull;
+            bool evidenceIsString;
+            if (!ReadEvidencePackageIdShape(
+                    json, out evidencePresent, out evidenceIsNull, out evidenceIsString))
+                return VoiceParseResult.Fail(VoiceParseCode.InvalidJson, "answer.display evidence_package_id type is invalid");
+            if (!evidencePresent)
+                return VoiceParseResult.Fail(VoiceParseCode.MissingRequiredField, "answer.display missing evidence_package_id");
+            if (!evidenceIsNull && !evidenceIsString)
+                return VoiceParseResult.Fail(VoiceParseCode.InvalidJson, "answer.display evidence_package_id type is invalid");
             var m = FromJson<AnswerDisplayMessage>(json);
             if (m == null) return VoiceParseResult.Fail(VoiceParseCode.InvalidJson, "answer.display malformed");
-            var missing = FirstMissing(m.session_id, m.turn_id, m.answer_id, m.evidence_package_id);
+            var missing = FirstMissing(m.session_id, m.turn_id, m.answer_id);
             if (missing != null) return VoiceParseResult.Fail(VoiceParseCode.MissingRequiredField, "answer.display missing " + missing);
+            if (evidenceIsString && string.IsNullOrEmpty(m.evidence_package_id))
+                return VoiceParseResult.Fail(VoiceParseCode.MissingRequiredField, "answer.display missing evidence_package_id");
             if (m.answer == null) return VoiceParseResult.Fail(VoiceParseCode.MissingRequiredField, "answer.display missing answer");
             var id = CheckIds(binding, m.session_id, m.turn_id, null, null);
             if (id != null) return VoiceParseResult.Fail(VoiceParseCode.BindingMismatch, "answer.display " + id);
             return VoiceParseResult.Ok(m);
+        }
+
+        // JsonUtility maps both a missing field and JSON null to a null string, and may
+        // silently coerce/drop values of the wrong type. Inspect only the root property so
+        // a nested field cannot satisfy this required wire contract.
+        private static bool ReadEvidencePackageIdShape(
+            string json, out bool present, out bool isNull, out bool isString)
+        {
+            present = false;
+            isNull = false;
+            isString = false;
+            int index = 0;
+            SkipJsonWhitespace(json, ref index);
+            if (index >= json.Length || json[index++] != '{') return false;
+            SkipJsonWhitespace(json, ref index);
+            if (index < json.Length && json[index] == '}') return true;
+            while (index < json.Length)
+            {
+                string key;
+                if (!ReadJsonString(json, ref index, out key)) return false;
+                SkipJsonWhitespace(json, ref index);
+                if (index >= json.Length || json[index++] != ':') return false;
+                SkipJsonWhitespace(json, ref index);
+                bool target = key == "evidence_package_id";
+                if (target && present) return false;
+                if (target)
+                {
+                    present = true;
+                    if (index < json.Length && json[index] == '"')
+                    {
+                        isString = ReadJsonString(json, ref index, out _);
+                        if (!isString) return false;
+                    }
+                    else if (json.Length - index >= 4 &&
+                             string.CompareOrdinal(json, index, "null", 0, 4) == 0)
+                    {
+                        index += 4;
+                        isNull = true;
+                    }
+                    else
+                    {
+                        return false;
+                    }
+                }
+                else if (!SkipJsonValue(json, ref index)) return false;
+                SkipJsonWhitespace(json, ref index);
+                if (index < json.Length && json[index] == ',')
+                {
+                    index++;
+                    SkipJsonWhitespace(json, ref index);
+                    continue;
+                }
+                if (index < json.Length && json[index] == '}') return true;
+                return false;
+            }
+            return false;
+        }
+
+        private static bool ReadJsonString(string json, ref int index, out string value)
+        {
+            value = null;
+            if (index >= json.Length || json[index++] != '"') return false;
+            var chars = new System.Text.StringBuilder();
+            while (index < json.Length)
+            {
+                char c = json[index++];
+                if (c == '"')
+                {
+                    value = chars.ToString();
+                    return true;
+                }
+                if (c < 0x20) return false;
+                if (c == '\\')
+                {
+                    if (index >= json.Length) return false;
+                    char escape = json[index++];
+                    if (escape == 'u')
+                    {
+                        if (index + 4 > json.Length) return false;
+                        for (int digit = 0; digit < 4; digit++)
+                            if (!System.Uri.IsHexDigit(json[index + digit])) return false;
+                        chars.Append((char)System.Convert.ToInt32(json.Substring(index, 4), 16));
+                        index += 4;
+                    }
+                    else
+                    {
+                        switch (escape)
+                        {
+                            case '"': chars.Append('"'); break;
+                            case '\\': chars.Append('\\'); break;
+                            case '/': chars.Append('/'); break;
+                            case 'b': chars.Append('\b'); break;
+                            case 'f': chars.Append('\f'); break;
+                            case 'n': chars.Append('\n'); break;
+                            case 'r': chars.Append('\r'); break;
+                            case 't': chars.Append('\t'); break;
+                            default: return false;
+                        }
+                    }
+                }
+                else chars.Append(c);
+            }
+            return false;
+        }
+
+        private static bool SkipJsonValue(string json, ref int index)
+        {
+            if (index >= json.Length) return false;
+            if (json[index] == '"')
+            {
+                string ignored;
+                return ReadJsonString(json, ref index, out ignored);
+            }
+            if (json[index] == '{' || json[index] == '[')
+            {
+                index++;
+                int depth = 1;
+                bool inString = false;
+                bool escaped = false;
+                while (index < json.Length)
+                {
+                    char c = json[index++];
+                    if (inString)
+                    {
+                        if (escaped) escaped = false;
+                        else if (c == '\\') escaped = true;
+                        else if (c == '"') inString = false;
+                        continue;
+                    }
+                    if (c == '"') inString = true;
+                    else if (c == '{' || c == '[') depth++;
+                    else if ((c == '}' || c == ']') && --depth == 0) return true;
+                }
+                return false;
+            }
+            int start = index;
+            while (index < json.Length && json[index] != ',' && json[index] != '}' &&
+                   !char.IsWhiteSpace(json[index])) index++;
+            return index > start;
+        }
+
+        private static void SkipJsonWhitespace(string json, ref int index)
+        {
+            while (index < json.Length && char.IsWhiteSpace(json[index])) index++;
         }
 
         private static VoiceParseResult ParseAnswerEvent(string json, VoiceBinding binding)

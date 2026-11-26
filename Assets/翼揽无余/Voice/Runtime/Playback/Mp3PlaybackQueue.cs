@@ -11,8 +11,8 @@
 //     failure, on cancel, and on dispose — never files outside that exact set or other directories.
 //   - Cancel() silences now: clears the queue, deletes owned temp files and bumps the generation so
 //     any late completion / late frame of the old generation is dropped (no audible leak).
-//   - A decode failure stops that item and removes its temp file, but does NOT touch the already
-//     displayed answer text (text downgrade); the round still ends Ready.
+//   - A decode failure removes owned temp files, preserves the displayed answer text (text downgrade),
+//     reports a stable failure, and never emits normal round completion.
 //   - Startup cleanup scans ONLY the dedicated dir for expired .mp3 files; it never recurses into
 //     other caches and never deletes files it is currently managing.
 //
@@ -51,13 +51,15 @@ namespace Yilan.Voice.Runtime.Playback
         private string _currentPlaybackId;
         private int _expectedSeq = -1;
         private int _generation;
-        private bool _isPlaying;
+        private int _activeDrainGeneration = -1;
         private bool _disposed;
 
         /// <summary>Fired for every successfully decoded item, strictly in sequence order.</summary>
         public event Action<TtsPlayedItem> FramePlayed;
         /// <summary>Fired per decode failure (text is preserved upstream, never deleted by playback).</summary>
         public event Action<string> FrameDecodeFailed;
+        /// <summary>Fired once when a local decode/playback failure aborts the round; reason is stable and non-sensitive.</summary>
+        public event Action<string, string> PlaybackFailed;
         /// <summary>Fired once per round when the ordered drain finishes (round back to Ready).</summary>
         public event Action<string> PlaybackCompleted;
 
@@ -83,7 +85,7 @@ namespace Yilan.Voice.Runtime.Playback
         public bool HasQueued => _queue.Count > 0;
 
         /// <summary>True while the sequential decode/play loop is actively running.</summary>
-        public bool IsPlaying => _isPlaying;
+        public bool IsPlaying => !_disposed && _activeDrainGeneration == _generation;
 
         /// <summary>
         /// Create a queue owning <paramref name="cacheDirectory"/> (default
@@ -163,7 +165,8 @@ namespace Yilan.Voice.Runtime.Playback
 
         private async void PlayLoop(int gen)
         {
-            _isPlaying = true;
+            _activeDrainGeneration = gen;
+            string playbackId = _currentPlaybackId;
             try
             {
                 while (_queue.Count > 0)
@@ -176,11 +179,11 @@ namespace Yilan.Voice.Runtime.Playback
 
                     TtsDecodeResult result;
                     try { result = await _decoder.DecodeAsync(path); }
-                    catch { result = TtsDecodeResult.Fail("decode_exception"); }
+                    catch { result = TtsDecodeResult.Fail("mp3_decode"); }
 
                     // Late completion of an old generation must be dropped (never played), and its
                     // temp file is still released regardless.
-                    bool stale = _disposed || gen != _generation;
+                    bool stale = _disposed || gen != _generation || item.Generation != gen;
                     if (stale)
                     {
                         DeleteManagedFile(path);
@@ -203,9 +206,12 @@ namespace Yilan.Voice.Runtime.Playback
                     }
                     else
                     {
-                        // Decode failure: stop this item, keep the already-displayed answer text
-                        // (text downgrade), and continue with the next ordered item.
-                        FrameDecodeFailed?.Invoke(item.PlaybackId);
+                        // Preserve the displayed answer text, report a stable reason, and abort
+                        // this round so it cannot be counted as a successful completion.
+                        playbackId = item.PlaybackId;
+                        AbortFailedRound();
+                        Notify(FrameDecodeFailed, item.PlaybackId);
+                        return;
                     }
                 }
 
@@ -222,11 +228,46 @@ namespace Yilan.Voice.Runtime.Playback
             }
             catch
             {
-                // Never let a drain fault escape; the queue remains coherent for the caller.
+                // Never expose exception text or count a failed drain as a completion.
+                if (_disposed || gen != _generation) return;
+                playbackId = playbackId ?? _currentPlaybackId;
+                AbortFailedRound();
+                Notify(PlaybackFailed, playbackId ?? string.Empty, "local_playback");
             }
             finally
             {
-                _isPlaying = false;
+                if (_activeDrainGeneration == gen)
+                    _activeDrainGeneration = -1;
+            }
+        }
+
+        private void AbortFailedRound()
+        {
+            if (!string.IsNullOrEmpty(_currentPlaybackId))
+                RememberInvalid(_currentPlaybackId);
+            foreach (var path in new List<string>(_managedFiles))
+                DeleteManagedFile(path);
+            _managedFiles.Clear();
+            _queue.Clear();
+            _currentPlaybackId = null;
+            _expectedSeq = -1;
+        }
+
+        private static void Notify<T>(Action<T> callback, T value)
+        {
+            if (callback == null) return;
+            foreach (Action<T> handler in callback.GetInvocationList())
+            {
+                try { handler(value); } catch { }
+            }
+        }
+
+        private static void Notify<T1, T2>(Action<T1, T2> callback, T1 first, T2 second)
+        {
+            if (callback == null) return;
+            foreach (Action<T1, T2> handler in callback.GetInvocationList())
+            {
+                try { handler(first, second); } catch { }
             }
         }
 
@@ -274,7 +315,13 @@ namespace Yilan.Voice.Runtime.Playback
             string path = Path.Combine(_cacheDirectory, name);
             File.WriteAllBytes(path, mp3);
             _managedFiles.Add(path);
-            _queue.Add(new QueueItem { PlaybackId = playbackId, Sequence = seq, FileName = name });
+            _queue.Add(new QueueItem
+            {
+                PlaybackId = playbackId,
+                Sequence = seq,
+                FileName = name,
+                Generation = _generation
+            });
         }
 
         /// <summary>Delete a temp file ONLY if it is one this queue registered (exact ownership).</summary>
@@ -337,6 +384,7 @@ namespace Yilan.Voice.Runtime.Playback
             // Release event subscriptions so a disposed queue cannot raise into stale listeners.
             FramePlayed = null;
             FrameDecodeFailed = null;
+            PlaybackFailed = null;
             PlaybackCompleted = null;
         }
 
@@ -345,6 +393,7 @@ namespace Yilan.Voice.Runtime.Playback
             public string PlaybackId;
             public int Sequence;
             public string FileName;
+            public int Generation;
         }
     }
 }

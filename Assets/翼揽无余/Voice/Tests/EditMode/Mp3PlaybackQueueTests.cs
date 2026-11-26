@@ -6,7 +6,7 @@
 // ever touched. Coverage: monotonic sequence across playbacks; duplicate (non-overwrite ignore);
 // missing-sequence (gap -> skip) ignore; is_final round -> back to Ready; cancel immediate silence
 // + generation isolation (a late decode completion of an old generation is dropped); decode failure
-// preserves the already-displayed answer text and the round still ends Ready; a straggler frame
+// preserves the already-displayed answer text and suppresses normal completion on failure; a straggler frame
 // from an abandoned round is dropped as WrongGeneration; a fresh round abandons an active one.
 //
 // NOTE: the bundled ext.nunit 3.5 has no ThrowsAsync/DoesNotThrowAsync, so all async assertions use
@@ -292,12 +292,12 @@ namespace Yilan.Voice.Playback
         // ---- decode failure preserves answer text --------------------------
 
         [Test]
-        public void DecodeFailure_PreservesDisplayedText_ReportsFailure_Continues_RoundEndsReady()
+        public void DecodeFailure_PreservesDisplayedText_ReportsFailure_AndSuppressesCompletion()
         {
             var cache = TestCacheRoot();
             var decoder = new FakeDecoder();
             decoder.BySequence[0] = Task.FromResult(TtsDecodeResult.Fail("decode_fail")); // seq 0 fails
-            decoder.BySequence[1] = Task.FromResult(TtsDecodeResult.Ok(null));            // seq 1 (final) succeeds
+            decoder.BySequence[1] = Task.FromResult(TtsDecodeResult.Ok(null));            // must not run after seq 0 failure
 
             var played = new List<int>();
             var completed = new List<string>();
@@ -313,10 +313,10 @@ namespace Yilan.Voice.Playback
                 Assert.AreEqual(TtsPlaybackCode.Accepted, Accepted(q, "pb-1", 0));
                 Assert.AreEqual(TtsPlaybackCode.RoundCompleted, q.EnqueueTts(Frame("pb-1", 1, true), new byte[] { 1, 2, 3 }));
 
-                // The failed item must NOT have been played; the following item still plays.
-                CollectionAssert.AreEqual(new[] { 1 }, played, "only successfully decoded frames play");
+                // A failed round is not counted as a normal successful completion.
+                CollectionAssert.IsEmpty(played, "later frames must not play after decode failure");
                 CollectionAssert.AreEqual(new[] { "pb-1" }, failedIds, "decode failure must be reported");
-                CollectionAssert.AreEqual(new[] { "pb-1" }, completed, "round still ends (Ready) on a decode failure");
+                CollectionAssert.IsEmpty(completed, "decode failure must not report normal completion");
 
                 // Text downgrade: the displayed answer text is preserved, never deleted by playback.
                 Assert.AreEqual("已显示的回答文本", displayedText, "decode failure must not clear displayed answer text");
@@ -325,6 +325,49 @@ namespace Yilan.Voice.Playback
                 Assert.IsFalse(q.IsPlaying);
                 Assert.AreEqual(0, q.ManagedFiles.Count);
                 Assert.AreEqual(0, CountMp3Files(cache), "failed temp file deleted too");
+            }
+            CleanupCache(cache);
+        }
+
+        [Test]
+        public void DecoderException_ReportsDecodeFailure_AndSuppressesCompletion()
+        {
+            var cache = TestCacheRoot();
+            var decoder = new FakeDecoder();
+            decoder.BySequence[0] = Task.FromException<TtsDecodeResult>(new InvalidOperationException("sensitive details"));
+            var completed = new List<string>();
+            var failedIds = new List<string>();
+            using (var q = new Mp3PlaybackQueue(decoder, cache))
+            {
+                q.PlaybackCompleted += pb => completed.Add(pb);
+                q.FrameDecodeFailed += pb => failedIds.Add(pb);
+                Assert.AreEqual(TtsPlaybackCode.RoundCompleted, q.EnqueueTts(Frame("pb-ex", 0, true), new byte[] { 1, 2, 3 }));
+                CollectionAssert.AreEqual(new[] { "pb-ex" }, failedIds);
+                CollectionAssert.IsEmpty(completed);
+                Assert.AreEqual(0, q.ManagedFiles.Count);
+                Assert.AreEqual(0, CountMp3Files(cache));
+            }
+            CleanupCache(cache);
+        }
+
+        [Test]
+        public void QueueFallbackException_ReportsLocalPlaybackFailure_AndSuppressesCompletion()
+        {
+            var cache = TestCacheRoot();
+            var decoder = new FakeDecoder();
+            var completed = new List<string>();
+            var failures = new List<string>();
+            int observedSuccesses = 0;
+            using (var q = new Mp3PlaybackQueue(decoder, cache))
+            {
+                q.FramePlayed += _ => throw new InvalidOperationException("sensitive details");
+                q.FramePlayed += _ => observedSuccesses++;
+                q.PlaybackCompleted += pb => completed.Add(pb);
+                q.PlaybackFailed += (pb, reason) => failures.Add(pb + ":" + reason);
+                Assert.AreEqual(TtsPlaybackCode.RoundCompleted, q.EnqueueTts(Frame("pb-fallback", 0, true), new byte[] { 1, 2, 3 }));
+                CollectionAssert.AreEqual(new[] { "pb-fallback:local_playback" }, failures);
+                CollectionAssert.IsEmpty(completed);
+                Assert.AreEqual(0, observedSuccesses);
             }
             CleanupCache(cache);
         }

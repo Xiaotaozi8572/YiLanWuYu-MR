@@ -90,6 +90,16 @@ namespace Yilan.Voice.Playback
             Assert.AreEqual(0, CountMp3(Path.Combine(Application.temporaryCachePath, Mp3PlaybackQueue.CacheFolderName)));
         }
 
+        [Test]
+        public void Decoder_EmptyPath_ReturnsStableMp3DecodeFailure()
+        {
+            var task = new UnityMp3Decoder().DecodeAsync(string.Empty);
+            Assert.IsTrue(task.IsCompleted);
+            Assert.IsFalse(task.Result.Success);
+            Assert.AreEqual("mp3_decode", task.Result.Error);
+            Assert.IsNull(task.Result.Clip);
+        }
+
         // ---- precise ownership: only own files in the dedicated dir --------
 
         [Test]

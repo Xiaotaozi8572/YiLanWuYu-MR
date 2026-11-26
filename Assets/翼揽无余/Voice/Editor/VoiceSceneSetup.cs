@@ -24,7 +24,7 @@ namespace Yilan.Voice.Editor
     public static class VoiceSceneSetup
     {
         private const string IntegrationScenePath = @"Assets/翼揽无余/Voice/Scenes/PicoVoiceIntegrationTest.unity";
-        private const string PrefabPath = @"Assets/翼揽无余/Voice/Prefabs/PicoVoiceClient.prefab";
+        private const string PrefabPath = @"Assets/Resources/Voice/PicoVoiceClient.prefab";
         private const string InstanceName = "PicoVoiceClient";
 
         public static void EnsureIntegrationSceneWired()
